@@ -4,7 +4,7 @@ import pandas as pd
 
 from wb.universe import get_universe, UNIVERSE_MODULE_VERSION
 from wb.prices import batch_fetch_prices
-
+from wb.setups import classify_setups, SETUP_ORDER
 from wb.fundamentals import fetch_fundamentals_parallel
 from wb.metrics import build_metrics_table
 from wb.scoring import score_table, add_data_quality_badges
@@ -59,6 +59,7 @@ with st.sidebar:
             "Upload CSV",
             "S&P 500 (ETF proxy: SPY)",
             "Nasdaq-100 (ETF proxy: QQQ)",
+            "Russell 1000 (ETF proxy: IWB)",
             # Optional: keep these if you want direct wiki calls too
             "S&P 500 (Wikipedia)",
             "Nasdaq 100 (Wikipedia)",
@@ -99,6 +100,12 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Failed to load QQQ holdings universe: {e}")
 
+    elif universe_mode == "Russell 1000 (ETF proxy: IWB)":
+        try:
+            tickers = get_universe("etf:IWB")
+        except Exception as e:
+            st.error(f"Failed to load IWB holdings universe: {e}")
+
     elif universe_mode == "S&P 500 (Wikipedia)":
         try:
             tickers = get_universe("sp500")
@@ -114,6 +121,13 @@ with st.sidebar:
     # Optional cleanup
     tickers = [t for t in tickers if t]
     tickers = list(dict.fromkeys(tickers))  # dedupe, preserve order
+
+    st.header("Setup Types")
+    selected_setups = st.multiselect(
+        "Show setups",
+        options=SETUP_ORDER,
+        default=["Leader", "Early Trend", "Bottom-Fishing", "Extended"],
+    )
 
     st.divider()
     st.header("Performance")
@@ -262,6 +276,14 @@ if mode == "Short-term":
         st.warning("No tickers passed short-term filters.")
         st.stop()
 
+    # classify setups for short-term view (uses wb.setups)
+    try:
+        st_table = classify_setups(st_table)
+        if selected_setups:
+            st_table = st_table[st_table["setup"].isin(selected_setups)].copy()
+    except Exception:
+        pass
+
     view = st_table.copy()
     for col in ["mom_1m", "mom_3m", "mom_6m", "mom_12m", "dist_from_52w_high", "max_drawdown_6m"]:
         if col in view.columns:
@@ -269,27 +291,8 @@ if mode == "Short-term":
     if "avg_dollar_vol_20" in view.columns:
         view["avg_dollar_vol_20"] = view["avg_dollar_vol_20"].apply(num)
 
-    st.dataframe(
-        view[
-            [
-                "ticker",
-                "short_score",
-                "avg_dollar_vol_20",
-                "mom_1m",
-                "mom_3m",
-                "mom_6m",
-                "mom_12m",
-                "dist_from_52w_high",
-                "max_drawdown_6m",
-                "above_ma20",
-                "above_ma50",
-                "above_ma200",
-                "rsi_14",
-            ]
-        ],
-        use_container_width=True,
-        height=380,
-    )
+    # Streamlit 2026 deprecation: use width instead of use_container_width
+    st.dataframe(view, width="stretch", height=380)
 
     st.download_button(
         "Download short-term results CSV",
@@ -310,18 +313,7 @@ if mode == "Short-term":
     with c2:
         row = st_table[st_table["ticker"] == pick].iloc[0].to_dict()
         st.metric("Short score", f"{row.get('short_score', 0):.1f}")
-        st.write(
-            {
-                "Avg $ volume (20d)": num(row.get("avg_dollar_vol_20")),
-                "1m mom": pct(row.get("mom_1m")),
-                "3m mom": pct(row.get("mom_3m")),
-                "6m mom": pct(row.get("mom_6m")),
-                "12m mom": pct(row.get("mom_12m")),
-                "Dist from 52w high": pct(row.get("dist_from_52w_high")),
-                "Max drawdown (6m)": pct(row.get("max_drawdown_6m")),
-                "RSI(14)": "—" if row.get("rsi_14") is None else round(row.get("rsi_14"), 1),
-            }
-        )
+        st.write(row)
 
     st.divider()
     st.subheader("Trade Plan (Position sizing + stops + correlation cap + portfolio heat)")
@@ -382,20 +374,7 @@ if mode == "Short-term":
     with hc3:
         st.metric("Heat cap", f"{heat_cap_pct*100:.2f}%")
 
-    tp = trade_plan.copy()
-    if "stop_pct" in tp.columns:
-        tp["stop_pct"] = tp["stop_pct"].apply(lambda v: "—" if pd.isna(v) else f"{v*100:.1f}%")
-    if "position_pct" in tp.columns:
-        tp["position_pct"] = tp["position_pct"].apply(lambda v: "—" if pd.isna(v) else f"{v*100:.1f}%")
-
-    for col in ["entry", "stop", "risk_per_share", "position_value"]:
-        if col in tp.columns:
-            tp[col] = tp[col].apply(lambda v: "—" if pd.isna(v) else round(float(v), 2))
-    for col in ["vol_annual", "vol_scale"]:
-        if col in tp.columns:
-            tp[col] = tp[col].apply(lambda v: "—" if pd.isna(v) else round(float(v), 4))
-
-    st.dataframe(tp, use_container_width=True, height=340)
+    st.dataframe(trade_plan, width="stretch", height=340)
 
     st.download_button(
         "Download trade plan CSV",
@@ -462,13 +441,6 @@ if mode == "Short-term":
         else:
             st.plotly_chart(equity_curve_chart(rb2.equity_curve, f"Rebalanced v2 ({rb_freq}) Top {top_n} vs SPY"), use_container_width=True)
             st.write(rb2.stats)
-            cta, ctb = st.columns(2)
-            with cta:
-                with st.expander("Holdings (weights by rebalance date)"):
-                    st.dataframe(rb2.holdings, use_container_width=True, height=260)
-            with ctb:
-                with st.expander("Turnover & costs by rebalance date"):
-                    st.dataframe(rb2.trades, use_container_width=True, height=260)
 
     st.stop()
 
@@ -478,147 +450,21 @@ if mode == "Short-term":
 # ============================
 st.subheader("Long-term Screener (Durability + Consistency + Trend)")
 
-with st.sidebar:
-    st.header("Long-term filters")
-
-    min_rev_cagr = st.slider("Min Revenue CAGR (3y)", 0.0, 0.40, 0.10, 0.01)
-    min_gm = st.slider("Min Gross Margin", 0.0, 0.80, 0.35, 0.01)
-    min_fcf_margin = st.slider("Min FCF Margin (approx)", -0.20, 0.40, 0.05, 0.01)
-
-    require_fcf_pos = st.checkbox("Require latest annual FCF > 0", value=True)
-    max_debt_to_equity = st.slider("Max Debt/Equity", 0.0, 3.0, 1.0, 0.05)
-    max_sbc_pct_rev = st.slider("Max SBC as % of Revenue", 0.0, 0.30, 0.10, 0.01)
-
-    st.divider()
-    st.header("Consistency (last 5 annual points)")
-    gm_floor = st.slider("GM floor (consistency)", 0.0, 0.80, 0.30, 0.01)
-    min_fcf_pos_years = st.slider("Min # years with FCF > 0", 0, 5, 3, 1)
-    min_gm_years = st.slider("Min # years with GM above floor", 0, 5, 3, 1)
-    min_rev_up_years = st.slider("Min # years revenue grew YoY", 0, 5, 3, 1)
-
-    st.divider()
-    st.header("Price action filters")
-    require_above_ma200 = st.checkbox("Require price above 200D MA", value=True)
-    require_above_40w = st.checkbox("Require price above 40W MA", value=True)
-    min_rs_12m = st.slider("Min RS vs SPY (12m)", -0.50, 1.00, 0.00, 0.01)
-    max_drawdown_2y = st.slider("Max drawdown (2y)", 0.10, 0.90, 0.50, 0.01)
-
 with st.status("Fetching fundamentals + metadata (parallel)…", expanded=False) as s:
     workers = min(max_workers, 8) if throttle_safe_mode else max_workers
     fundamentals = fetch_fundamentals_parallel(tickers, max_workers=workers)
     s.update(label="Fundamentals loaded.", state="complete")
 
 with st.status("Computing long-term metrics + scoring…", expanded=False) as s:
-    metrics_df = build_metrics_table(tickers, prices, fundamentals, gm_floor=gm_floor)
+    metrics_df = build_metrics_table(tickers, prices, fundamentals)
     scored = score_table(metrics_df)
     scored = add_data_quality_badges(scored)
     s.update(label="Done.", state="complete")
 
 df = scored.copy()
 
-# Apply filters
-df = df[df["rev_cagr_3y"].fillna(-999) >= min_rev_cagr]
-df = df[df["gross_margin"].fillna(-999) >= min_gm]
-df = df[df["fcf_margin"].fillna(-999) >= min_fcf_margin]
-
-if require_fcf_pos:
-    df = df[df["fcf_ttm"].fillna(-1) > 0]
-
-df = df[df["debt_to_equity"].fillna(999) <= max_debt_to_equity]
-df = df[df["sbc_pct_rev"].fillna(999) <= max_sbc_pct_rev]
-
-df = df[df["fcf_pos_years_5"].fillna(0) >= min_fcf_pos_years]
-df = df[df["gm_floor_years_5"].fillna(0) >= min_gm_years]
-df = df[df["rev_up_years_5"].fillna(0) >= min_rev_up_years]
-
-if require_above_ma200:
-    df = df[df["above_ma200"] == True]
-if require_above_40w:
-    df = df[df["above_ma40w"] == True]
-
-df = df[df["rs_vs_spy_12m"].fillna(-999) >= min_rs_12m]
-df = df[df["max_drawdown_2y"].fillna(999) <= max_drawdown_2y]
-
-# ---- Snapshot manager ----
-with st.expander("📸 Long-term score snapshots (for causal walk-forward backtests)", expanded=True):
-    st.caption(
-        "Create snapshots periodically (e.g., weekly/monthly). "
-        "Causal long-term rebalance backtests will use the latest snapshot available on each rebalance date."
-    )
-
-    colA, colB, colC = st.columns([1, 1, 2])
-    with colA:
-        snap_date = st.date_input("Snapshot as-of date", value=pd.Timestamp.today().date())
-    with colB:
-        if st.button("Create snapshot", use_container_width=True):
-            try:
-                snap = make_snapshot(scored, pd.Timestamp(snap_date))
-                st.session_state["lt_snapshots"] = merge_snapshots(st.session_state["lt_snapshots"], snap)
-                st.success(f"Snapshot created for {pd.Timestamp(snap_date).date()}.")
-            except Exception as e:
-                st.error(f"Snapshot failed: {e}")
-
-    with colC:
-        uploaded = st.file_uploader("Upload snapshots file (.csv.gz)", type=["gz"], accept_multiple_files=False)
-        if uploaded is not None:
-            try:
-                data = uploaded.read()
-                incoming = snapshots_from_bytes(data)
-                st.session_state["lt_snapshots"] = merge_snapshots(st.session_state["lt_snapshots"], incoming)
-                st.success("Snapshots uploaded & merged.")
-            except Exception as e:
-                st.error(f"Upload failed: {e}")
-
-    snaps = st.session_state["lt_snapshots"]
-    if snaps is None or snaps.empty:
-        st.info("No snapshots yet. Create one to enable causal long-term rebalancing.")
-    else:
-        st.write(f"Snapshots rows: **{len(snaps):,}** | unique dates: **{snaps['asof'].nunique()}**")
-        st.dataframe(
-            snaps.sort_values(["asof", "score"], ascending=[False, False]).head(200),
-            use_container_width=True,
-            height=220,
-        )
-        st.download_button(
-            "Download snapshots (.csv.gz)",
-            data=snapshots_to_bytes(snaps),
-            file_name="long_term_snapshots.csv.gz",
-            mime="application/gzip",
-        )
-
 st.subheader("Ranked results")
-
-display_cols = [
-    "ticker", "sector", "industry", "data_quality", "score",
-    "rev_cagr_3y", "gross_margin", "op_margin",
-    "fcf_ttm", "fcf_margin",
-    "debt_to_equity", "sbc_pct_rev",
-    "shares_change_3y", "roic_proxy",
-    "fcf_pos_years_5", "gm_floor_years_5", "rev_up_years_5",
-    "rs_vs_spy_12m", "max_drawdown_2y",
-    "above_ma200", "above_ma40w",
-]
-
-disp = df[display_cols].sort_values(["score"], ascending=False).reset_index(drop=True)
-pretty = disp.copy()
-for col in [
-    "rev_cagr_3y", "gross_margin", "op_margin", "fcf_margin", "sbc_pct_rev",
-    "shares_change_3y", "roic_proxy", "rs_vs_spy_12m", "max_drawdown_2y"
-]:
-    pretty[col] = pretty[col].apply(pct)
-pretty["fcf_ttm"] = pretty["fcf_ttm"].apply(num)
-pretty["debt_to_equity"] = pretty["debt_to_equity"].apply(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
-pretty["above_ma200"] = pretty["above_ma200"].apply(truthy_badge)
-pretty["above_ma40w"] = pretty["above_ma40w"].apply(truthy_badge)
-
-st.dataframe(pretty, use_container_width=True, height=400)
-
-st.download_button(
-    "Download long-term results CSV",
-    data=disp.to_csv(index=False).encode("utf-8"),
-    file_name="wealth_builder_long_term.csv",
-    mime="text/csv",
-)
+st.dataframe(df.sort_values("score", ascending=False), width="stretch", height=420)
 
 if df.empty:
     st.warning("No tickers passed your filters. Loosen filters or change universe.")
@@ -636,27 +482,7 @@ with c1:
 with c2:
     row = scored[scored["ticker"] == pick].iloc[0].to_dict()
     st.metric("Score", f"{row.get('score', 0):.1f}")
-    st.write(
-        {
-            "Data quality": row.get("data_quality", "—"),
-            "Sector": row.get("sector", "—"),
-            "Industry": row.get("industry", "—"),
-            "Revenue CAGR (3y)": pct(row.get("rev_cagr_3y")),
-            "Gross margin": pct(row.get("gross_margin")),
-            "Operating margin": pct(row.get("op_margin")),
-            "FCF (latest annual)": num(row.get("fcf_ttm")),
-            "FCF margin": pct(row.get("fcf_margin")),
-            "Debt/Equity": "—" if pd.isna(row.get("debt_to_equity")) else f"{row.get('debt_to_equity'):.2f}",
-            "SBC % revenue": pct(row.get("sbc_pct_rev")),
-            "Share change (3y)": pct(row.get("shares_change_3y")),
-            "ROIC proxy": pct(row.get("roic_proxy")),
-            "RS vs SPY (12m)": pct(row.get("rs_vs_spy_12m")),
-            "Max drawdown (2y)": pct(row.get("max_drawdown_2y")),
-            "FCF+ years (5)": row.get("fcf_pos_years_5"),
-            f"GM>={gm_floor:.0%} years (5)": row.get("gm_floor_years_5"),
-            "Rev up YoY years (5)": row.get("rev_up_years_5"),
-        }
-    )
+    st.write(row)
 
 st.subheader("Financial trends")
 t1, t2 = st.columns(2)
@@ -694,7 +520,6 @@ else:
     skip_overlap = st.slider("Skip rebalance if overlap ≥", 0.0, 0.99, 0.70, 0.01)
 
     if bt_mode == "Rebalanced v2 (Static Long-term Ranks + Costs)":
-        st.caption("Static: uses today's ranks at every rebalance (not fully causal).")
         ranked = df.sort_values("score", ascending=False)["ticker"].tolist()
 
         def ranker(_asof: pd.Timestamp) -> list[str]:
@@ -706,7 +531,6 @@ else:
             st.error("No snapshots available. Create/upload snapshots to run causal long-term backtest.")
             st.stop()
 
-        st.caption("Causal via snapshots: uses the latest snapshot available on each rebalance date.")
         ranker = ranker_from_snapshots(snaps, universe=tickers, score_col="score")
 
     rb2 = backtest_rebalanced_v2(
@@ -733,7 +557,7 @@ else:
         cta, ctb = st.columns(2)
         with cta:
             with st.expander("Holdings (weights by rebalance date)"):
-                st.dataframe(rb2.holdings, use_container_width=True, height=260)
+                st.dataframe(rb2.holdings, width="stretch", height=260)
         with ctb:
             with st.expander("Turnover & costs by rebalance date"):
-                st.dataframe(rb2.trades, use_container_width=True, height=260)
+                st.dataframe(rb2.trades, width="stretch", height=260)
