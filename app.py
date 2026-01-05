@@ -1,9 +1,3 @@
-
----
-
-## `app.py`
-
-```python
 import streamlit as st
 import pandas as pd
 
@@ -11,7 +5,7 @@ from wb.universe import get_universe
 from wb.prices import batch_fetch_prices
 from wb.fundamentals import fetch_fundamentals_parallel
 from wb.metrics import build_metrics_table
-from wb.scoring import score_table
+from wb.scoring import score_table, add_data_quality_badges
 from wb.charts import (
     make_weekly_candles,
     make_relative_strength,
@@ -23,7 +17,7 @@ from wb.charts import (
 st.set_page_config(page_title="Wealth Builder Screener", layout="wide")
 
 st.title("Wealth Builder Screener")
-st.caption("Long-term screening: trend health + financial durability + quality. (Short-term tools later.)")
+st.caption("Long-term screening: trend health + durability + quality + consistency. (Short-term tools later.)")
 
 with st.sidebar:
     st.header("Universe")
@@ -68,6 +62,14 @@ with st.sidebar:
     max_sbc_pct_rev = st.slider("Max SBC as % of Revenue", 0.0, 0.30, 0.10, 0.01)
 
     st.divider()
+    st.header("Consistency (last 5y, annual)")
+
+    min_fcf_pos_years = st.slider("Min # years with FCF > 0", 0, 5, 3, 1)
+    min_gm_years = st.slider("Min # years with GM above floor", 0, 5, 3, 1)
+    gm_floor = st.slider("GM floor for consistency", 0.0, 0.80, 0.30, 0.01)
+    min_rev_up_years = st.slider("Min # years revenue grew YoY", 0, 5, 3, 1)
+
+    st.divider()
     st.header("Price action filters")
 
     require_above_ma200 = st.checkbox("Require price above 200D MA", value=True)
@@ -78,7 +80,7 @@ with st.sidebar:
     st.divider()
     st.header("Performance")
     max_workers = st.slider("Parallel workers", 4, 32, 16, 1)
-    st.caption("More workers = faster, but may hit provider throttling on large universes.")
+    st.caption("More workers = faster, but large universes may hit throttling occasionally.")
 
     run = st.button("Run screen", type="primary")
 
@@ -87,86 +89,103 @@ if not tickers:
     st.stop()
 
 if run:
-    tickers = sorted(list(dict.fromkeys([t for t in tickers if t.isalnum() or "-" in t or "." in t])))
+    # Clean tickers
+    tickers = [t for t in tickers if t and isinstance(t, str)]
+    tickers = sorted(list(dict.fromkeys([t.strip().upper() for t in tickers if t.strip()])))
     st.write(f"Universe size: **{len(tickers)}**")
 
-    # 1) Prices (batch)
+    # ✅ Always include SPY for price dataset (RS calculation)
+    tickers_for_prices = sorted(list(dict.fromkeys(tickers + ["SPY"])))
+
     with st.status("Fetching price data (batch)…", expanded=False) as s:
-        prices = batch_fetch_prices(tickers, years=5)
+        prices = batch_fetch_prices(tickers_for_prices, years=5)
         s.update(label="Price data loaded.", state="complete")
 
-    # 2) Fundamentals (parallel)
-    with st.status("Fetching fundamentals (parallel)…", expanded=False) as s:
+    with st.status("Fetching fundamentals + metadata (parallel)…", expanded=False) as s:
         fundamentals = fetch_fundamentals_parallel(tickers, max_workers=max_workers)
         s.update(label="Fundamentals loaded.", state="complete")
 
-    # 3) Metrics table
     with st.status("Computing metrics + scoring…", expanded=False) as s:
-        metrics_df = build_metrics_table(tickers, prices, fundamentals)
+        metrics_df = build_metrics_table(tickers, prices, fundamentals, gm_floor=gm_floor)
         scored = score_table(metrics_df)
+        scored = add_data_quality_badges(scored)
         s.update(label="Done.", state="complete")
 
     # Apply filters
     df = scored.copy()
 
-    # Fundamental filters
+    # Fundamentals filters
     df = df[df["rev_cagr_3y"].fillna(-999) >= min_rev_cagr]
     df = df[df["gross_margin"].fillna(-999) >= min_gm]
     df = df[df["fcf_margin"].fillna(-999) >= min_fcf_margin]
+
     if require_fcf_pos:
         df = df[df["fcf_ttm"].fillna(-1) > 0]
+
     df = df[df["debt_to_equity"].fillna(999) <= max_debt_to_equity]
     df = df[df["sbc_pct_rev"].fillna(999) <= max_sbc_pct_rev]
+
+    # Consistency filters
+    df = df[df["fcf_pos_years_5"].fillna(0) >= min_fcf_pos_years]
+    df = df[df["gm_floor_years_5"].fillna(0) >= min_gm_years]
+    df = df[df["rev_up_years_5"].fillna(0) >= min_rev_up_years]
 
     # Price filters
     if require_above_ma200:
         df = df[df["above_ma200"] == True]
     if require_above_40w:
         df = df[df["above_ma40w"] == True]
+
     df = df[df["rs_vs_spy_12m"].fillna(-999) >= min_rs_12m]
     df = df[df["max_drawdown_2y"].fillna(999) <= max_drawdown_2y]
 
     st.subheader("Ranked results")
-    st.caption("Tip: sort by Score, then sanity-check business quality and narrative. Charts validate trend health.")
 
-    display_cols = [
-        "ticker",
-        "score",
-        "rev_cagr_3y",
-        "gross_margin",
-        "op_margin",
-        "fcf_ttm",
-        "fcf_margin",
-        "debt_to_equity",
-        "sbc_pct_rev",
-        "rs_vs_spy_12m",
-        "max_drawdown_2y",
-        "above_ma200",
-        "above_ma40w",
-    ]
-    disp = df[display_cols].sort_values(["score"], ascending=False).reset_index(drop=True)
+    def pct(x):
+        return "—" if pd.isna(x) else f"{x*100:.1f}%"
 
-    def pct(x): return "—" if pd.isna(x) else f"{x*100:.1f}%"
     def num(x):
-        if pd.isna(x): return "—"
+        if pd.isna(x):
+            return "—"
         ax = abs(x)
-        if ax >= 1e9: return f"{x/1e9:.2f}B"
-        if ax >= 1e6: return f"{x/1e6:.1f}M"
-        if ax >= 1e3: return f"{x/1e3:.1f}K"
+        if ax >= 1e9:
+            return f"{x/1e9:.2f}B"
+        if ax >= 1e6:
+            return f"{x/1e6:.1f}M"
+        if ax >= 1e3:
+            return f"{x/1e3:.1f}K"
         return f"{x:.0f}"
 
-    pretty = disp.copy()
-    pretty["rev_cagr_3y"] = pretty["rev_cagr_3y"].apply(pct)
-    pretty["gross_margin"] = pretty["gross_margin"].apply(pct)
-    pretty["op_margin"] = pretty["op_margin"].apply(pct)
-    pretty["fcf_ttm"] = pretty["fcf_ttm"].apply(num)
-    pretty["fcf_margin"] = pretty["fcf_margin"].apply(pct)
-    pretty["debt_to_equity"] = pretty["debt_to_equity"].apply(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
-    pretty["sbc_pct_rev"] = pretty["sbc_pct_rev"].apply(pct)
-    pretty["rs_vs_spy_12m"] = pretty["rs_vs_spy_12m"].apply(pct)
-    pretty["max_drawdown_2y"] = pretty["max_drawdown_2y"].apply(pct)
+    display_cols = [
+        "ticker", "sector", "industry", "data_quality", "score",
+        "rev_cagr_3y", "gross_margin", "op_margin",
+        "fcf_ttm", "fcf_margin",
+        "debt_to_equity", "sbc_pct_rev",
+        "shares_change_3y", "roic_proxy",
+        "fcf_pos_years_5", "gm_floor_years_5", "rev_up_years_5",
+        "rs_vs_spy_12m", "max_drawdown_2y",
+        "above_ma200", "above_ma40w",
+    ]
 
-    st.dataframe(pretty, use_container_width=True, height=360)
+    disp = df[display_cols].sort_values(["score"], ascending=False).reset_index(drop=True)
+    pretty = disp.copy()
+
+    for col in ["rev_cagr_3y", "gross_margin", "op_margin", "fcf_margin", "sbc_pct_rev", "shares_change_3y", "roic_proxy", "rs_vs_spy_12m", "max_drawdown_2y"]:
+        pretty[col] = pretty[col].apply(pct)
+
+    pretty["fcf_ttm"] = pretty["fcf_ttm"].apply(num)
+    pretty["debt_to_equity"] = pretty["debt_to_equity"].apply(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
+    pretty["above_ma200"] = pretty["above_ma200"].apply(lambda x: "✅" if x else "—")
+    pretty["above_ma40w"] = pretty["above_ma40w"].apply(lambda x: "✅" if x else "—")
+
+    st.dataframe(pretty, use_container_width=True, height=380)
+
+    st.download_button(
+        "Download results CSV",
+        data=disp.to_csv(index=False).encode("utf-8"),
+        file_name="wealth_builder_screen.csv",
+        mime="text/csv",
+    )
 
     if df.empty:
         st.warning("No tickers passed your filters. Loosen filters or change universe.")
@@ -186,6 +205,9 @@ if run:
         st.markdown("### Snapshot")
         st.metric("Score", f"{row.get('score', 0):.1f}")
         st.write({
+            "Data quality": row.get("data_quality", "—"),
+            "Sector": row.get("sector", "—"),
+            "Industry": row.get("industry", "—"),
             "Revenue CAGR (3y)": pct(row.get("rev_cagr_3y")),
             "Gross margin": pct(row.get("gross_margin")),
             "Operating margin": pct(row.get("op_margin")),
@@ -193,17 +215,13 @@ if run:
             "FCF margin": pct(row.get("fcf_margin")),
             "Debt/Equity": "—" if pd.isna(row.get("debt_to_equity")) else f"{row.get('debt_to_equity'):.2f}",
             "SBC % revenue": pct(row.get("sbc_pct_rev")),
+            "Share change (3y)": pct(row.get("shares_change_3y")),
+            "ROIC proxy": pct(row.get("roic_proxy")),
             "RS vs SPY (12m)": pct(row.get("rs_vs_spy_12m")),
             "Max drawdown (2y)": pct(row.get("max_drawdown_2y")),
-        })
-
-        st.markdown("### Quality checks")
-        st.write({
-            "Positive FCF?": "✅" if (row.get("fcf_ttm") is not None and row.get("fcf_ttm") > 0) else "—",
-            "Above MA200?": "✅" if row.get("above_ma200") else "—",
-            "Above 40W?": "✅" if row.get("above_ma40w") else "—",
-            "ROIC-ish proxy": pct(row.get("roic_proxy")),
-            "Share dilution proxy (3y)": pct(row.get("shares_change_3y")),
+            "FCF+ years (5)": row.get("fcf_pos_years_5"),
+            f"GM>={gm_floor:.0%} years (5)": row.get("gm_floor_years_5"),
+            "Rev up YoY years (5)": row.get("rev_up_years_5"),
         })
 
     st.subheader("Financial trends")
@@ -212,6 +230,21 @@ if run:
         st.plotly_chart(make_margin_trends(fundamentals, pick), use_container_width=True)
     with t2:
         st.plotly_chart(make_cashflow_trends(fundamentals, pick), use_container_width=True)
+
+    # Simple peer compare (same sector)
+    st.subheader("Peer compare (same sector, best-effort)")
+    sector = scored.loc[scored["ticker"] == pick, "sector"].iloc[0]
+    peers = scored[scored["sector"] == sector].copy()
+    peers = peers.sort_values("score", ascending=False).head(25)
+
+    peer_cols = ["ticker", "score", "rev_cagr_3y", "gross_margin", "op_margin", "fcf_margin", "debt_to_equity", "sbc_pct_rev", "rs_vs_spy_12m"]
+    peer_disp = peers[peer_cols].copy()
+
+    for col in ["rev_cagr_3y", "gross_margin", "op_margin", "fcf_margin", "sbc_pct_rev", "rs_vs_spy_12m"]:
+        peer_disp[col] = peer_disp[col].apply(pct)
+    peer_disp["debt_to_equity"] = peer_disp["debt_to_equity"].apply(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
+
+    st.dataframe(peer_disp, use_container_width=True, height=320)
 
 else:
     st.info("Pick a universe and click **Run screen**.")
