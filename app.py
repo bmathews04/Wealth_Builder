@@ -25,7 +25,6 @@ from wb.short_term import (
 )
 
 from wb.backtest import backtest_equal_weight, equity_curve_chart
-from wb.backtest_rebalance import backtest_monthly_rebalanced
 from wb.backtest_rebalance_v2 import backtest_rebalanced_v2
 
 from wb.risk import RiskParams, build_trade_plan
@@ -34,6 +33,9 @@ from wb.risk_v2 import (
     portfolio_heat,
     enforce_heat_cap,
 )
+
+from wb.snapshots import make_snapshot, merge_snapshots, snapshots_to_bytes, snapshots_from_bytes
+from wb.causal_ranker import ranker_from_snapshots
 
 
 st.set_page_config(page_title="Wealth Builder Screener", layout="wide")
@@ -84,6 +86,13 @@ with st.sidebar:
 
     throttle_safe_mode = st.checkbox("Throttle-safe mode", value=False)
     st.caption("If screening large universes and seeing missing fundamentals, enable this.")
+
+
+# ----------------------------
+# Session state for snapshots
+# ----------------------------
+if "lt_snapshots" not in st.session_state:
+    st.session_state["lt_snapshots"] = pd.DataFrame()
 
 
 # ----------------------------
@@ -250,7 +259,6 @@ if mode == "Short-term":
         mime="text/csv",
     )
 
-    # ---- Deep dive charts ----
     st.subheader("Deep dive")
     pick = st.selectbox("Select a ticker", st_table["ticker"].tolist(), index=0)
 
@@ -262,7 +270,6 @@ if mode == "Short-term":
 
     with c2:
         row = st_table[st_table["ticker"] == pick].iloc[0].to_dict()
-        st.markdown("### Short-term snapshot")
         st.metric("Short score", f"{row.get('short_score', 0):.1f}")
         st.write(
             {
@@ -277,14 +284,10 @@ if mode == "Short-term":
             }
         )
 
-    # ----------------------------
-    # Risk module v2: correlation cap + portfolio heat
-    # ----------------------------
     st.divider()
     st.subheader("Trade Plan (Position sizing + stops + correlation cap + portfolio heat)")
 
     rp_col1, rp_col2, rp_col3 = st.columns(3)
-
     with rp_col1:
         account_size = st.number_input("Account size ($)", value=10_000.0, step=1_000.0)
         risk_pct = st.slider("Risk per trade (%)", 0.1, 5.0, 1.0, 0.1) / 100.0
@@ -362,9 +365,6 @@ if mode == "Short-term":
         mime="text/csv",
     )
 
-    # ----------------------------
-    # Backtests (Short-term): Buy&Hold OR Rebalanced v2 (causal + costs + weekly/monthly)
-    # ----------------------------
     st.divider()
     st.subheader("Backtest (Top-N vs SPY)")
 
@@ -373,9 +373,7 @@ if mode == "Short-term":
         ["Buy & Hold", "Rebalanced v2 (Causal Momentum + Costs)"],
         index=0,
     )
-
     top_n = st.slider("Top N", 5, min(50, len(st_table)), 10, 1)
-
     start = st.date_input("Start date", value=pd.Timestamp.today() - pd.Timedelta(days=365 * 3))
     end = st.date_input("End date", value=pd.Timestamp.today())
 
@@ -387,7 +385,6 @@ if mode == "Short-term":
         else:
             st.plotly_chart(equity_curve_chart(res.equity_curve, f"Buy & Hold Top {top_n} vs SPY"), use_container_width=True)
             st.write(res.stats)
-
     else:
         mom_choice = st.selectbox("Momentum lookback", ["3M", "6M", "12M"], index=1)
         mom_map = {"3M": "ret_63d", "6M": "ret_126d", "12M": "ret_252d"}
@@ -399,7 +396,6 @@ if mode == "Short-term":
         fee_bps = st.slider("Transaction cost (bps)", 0.0, 50.0, 5.0, 0.5)
         skip_overlap = st.slider("Skip rebalance if overlap ≥", 0.0, 0.99, 0.70, 0.01)
 
-        # Causal ranker: computed as-of each rebalance date
         ranker = _causal_momentum_ranker_factory(
             prices_long=prices,
             universe=tickers,
@@ -425,10 +421,7 @@ if mode == "Short-term":
         if "error" in rb2.stats:
             st.error(rb2.stats["error"])
         else:
-            st.plotly_chart(
-                equity_curve_chart(rb2.equity_curve, f"Rebalanced v2 ({rb_freq}) Top {top_n} vs SPY"),
-                use_container_width=True,
-            )
+            st.plotly_chart(equity_curve_chart(rb2.equity_curve, f"Rebalanced v2 ({rb_freq}) Top {top_n} vs SPY"), use_container_width=True)
             st.write(rb2.stats)
             cta, ctb = st.columns(2)
             with cta:
@@ -507,48 +500,73 @@ if require_above_40w:
 df = df[df["rs_vs_spy_12m"].fillna(-999) >= min_rs_12m]
 df = df[df["max_drawdown_2y"].fillna(999) <= max_drawdown_2y]
 
+# ---- Snapshot manager ----
+with st.expander("📸 Long-term score snapshots (for causal walk-forward backtests)", expanded=True):
+    st.caption(
+        "Create snapshots periodically (e.g., weekly/monthly). "
+        "Causal long-term rebalance backtests will use the latest snapshot available on each rebalance date."
+    )
+
+    colA, colB, colC = st.columns([1, 1, 2])
+    with colA:
+        snap_date = st.date_input("Snapshot as-of date", value=pd.Timestamp.today().date())
+    with colB:
+        if st.button("Create snapshot", use_container_width=True):
+            try:
+                snap = make_snapshot(scored, pd.Timestamp(snap_date))
+                st.session_state["lt_snapshots"] = merge_snapshots(st.session_state["lt_snapshots"], snap)
+                st.success(f"Snapshot created for {pd.Timestamp(snap_date).date()}.")
+            except Exception as e:
+                st.error(f"Snapshot failed: {e}")
+
+    with colC:
+        uploaded = st.file_uploader("Upload snapshots file (.csv.gz)", type=["gz"], accept_multiple_files=False)
+        if uploaded is not None:
+            try:
+                data = uploaded.read()
+                incoming = snapshots_from_bytes(data)
+                st.session_state["lt_snapshots"] = merge_snapshots(st.session_state["lt_snapshots"], incoming)
+                st.success("Snapshots uploaded & merged.")
+            except Exception as e:
+                st.error(f"Upload failed: {e}")
+
+    snaps = st.session_state["lt_snapshots"]
+    if snaps is None or snaps.empty:
+        st.info("No snapshots yet. Create one to enable causal long-term rebalancing.")
+    else:
+        st.write(f"Snapshots rows: **{len(snaps):,}** | unique dates: **{snaps['asof'].nunique()}**")
+        st.dataframe(
+            snaps.sort_values(["asof", "score"], ascending=[False, False]).head(200),
+            use_container_width=True,
+            height=220,
+        )
+        st.download_button(
+            "Download snapshots (.csv.gz)",
+            data=snapshots_to_bytes(snaps),
+            file_name="long_term_snapshots.csv.gz",
+            mime="application/gzip",
+        )
+
 st.subheader("Ranked results")
 
 display_cols = [
-    "ticker",
-    "sector",
-    "industry",
-    "data_quality",
-    "score",
-    "rev_cagr_3y",
-    "gross_margin",
-    "op_margin",
-    "fcf_ttm",
-    "fcf_margin",
-    "debt_to_equity",
-    "sbc_pct_rev",
-    "shares_change_3y",
-    "roic_proxy",
-    "fcf_pos_years_5",
-    "gm_floor_years_5",
-    "rev_up_years_5",
-    "rs_vs_spy_12m",
-    "max_drawdown_2y",
-    "above_ma200",
-    "above_ma40w",
+    "ticker", "sector", "industry", "data_quality", "score",
+    "rev_cagr_3y", "gross_margin", "op_margin",
+    "fcf_ttm", "fcf_margin",
+    "debt_to_equity", "sbc_pct_rev",
+    "shares_change_3y", "roic_proxy",
+    "fcf_pos_years_5", "gm_floor_years_5", "rev_up_years_5",
+    "rs_vs_spy_12m", "max_drawdown_2y",
+    "above_ma200", "above_ma40w",
 ]
 
 disp = df[display_cols].sort_values(["score"], ascending=False).reset_index(drop=True)
 pretty = disp.copy()
-
 for col in [
-    "rev_cagr_3y",
-    "gross_margin",
-    "op_margin",
-    "fcf_margin",
-    "sbc_pct_rev",
-    "shares_change_3y",
-    "roic_proxy",
-    "rs_vs_spy_12m",
-    "max_drawdown_2y",
+    "rev_cagr_3y", "gross_margin", "op_margin", "fcf_margin", "sbc_pct_rev",
+    "shares_change_3y", "roic_proxy", "rs_vs_spy_12m", "max_drawdown_2y"
 ]:
     pretty[col] = pretty[col].apply(pct)
-
 pretty["fcf_ttm"] = pretty["fcf_ttm"].apply(num)
 pretty["debt_to_equity"] = pretty["debt_to_equity"].apply(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
 pretty["above_ma200"] = pretty["above_ma200"].apply(truthy_badge)
@@ -567,7 +585,6 @@ if df.empty:
     st.warning("No tickers passed your filters. Loosen filters or change universe.")
     st.stop()
 
-# ---- Deep dive ----
 st.subheader("Deep dive")
 pick = st.selectbox("Select a ticker", df.sort_values("score", ascending=False)["ticker"].tolist(), index=0)
 
@@ -579,7 +596,6 @@ with c1:
 
 with c2:
     row = scored[scored["ticker"] == pick].iloc[0].to_dict()
-    st.markdown("### Snapshot")
     st.metric("Score", f"{row.get('score', 0):.1f}")
     st.write(
         {
@@ -610,13 +626,12 @@ with t1:
 with t2:
     st.plotly_chart(make_cashflow_trends(fundamentals, pick), use_container_width=True)
 
-# ---- Backtests (Long-term): Buy&Hold OR Rebalanced v2 (static ranks + costs) ----
 st.divider()
 st.subheader("Backtest (Top-N vs SPY)")
 
 bt_mode = st.selectbox(
     "Backtest mode",
-    ["Buy & Hold", "Rebalanced v2 (Static Long-term Ranks + Costs)"],
+    ["Buy & Hold", "Rebalanced v2 (Static Long-term Ranks + Costs)", "Rebalanced v2 (Causal via Snapshots + Costs)"],
     index=0,
 )
 top_n = st.slider("Top N", 5, min(50, len(df)), 10, 1)
@@ -634,21 +649,30 @@ if bt_mode == "Buy & Hold":
         st.write(res.stats)
 
 else:
-    st.caption("Note: This rebalance uses today's long-term ranks at every rebalance (static).")
     rb_freq = st.selectbox("Rebalance frequency", ["Monthly", "Weekly"], index=0)
     rb_code = "M" if rb_freq == "Monthly" else "W"
-
     fee_bps = st.slider("Transaction cost (bps)", 0.0, 50.0, 5.0, 0.5)
     skip_overlap = st.slider("Skip rebalance if overlap ≥", 0.0, 0.99, 0.70, 0.01)
 
-    ranked = df.sort_values("score", ascending=False)["ticker"].tolist()
+    if bt_mode == "Rebalanced v2 (Static Long-term Ranks + Costs)":
+        st.caption("Static: uses today's ranks at every rebalance (not fully causal).")
+        ranked = df.sort_values("score", ascending=False)["ticker"].tolist()
 
-    def ranker(_asof: pd.Timestamp) -> list[str]:
-        return ranked
+        def ranker(_asof: pd.Timestamp) -> list[str]:
+            return ranked
+
+    else:
+        snaps = st.session_state["lt_snapshots"]
+        if snaps is None or snaps.empty:
+            st.error("No snapshots available. Create/upload snapshots to run causal long-term backtest.")
+            st.stop()
+
+        st.caption("Causal via snapshots: uses the latest snapshot available on each rebalance date.")
+        ranker = ranker_from_snapshots(snaps, universe=tickers, score_col="score")
 
     rb2 = backtest_rebalanced_v2(
         prices=prices,
-        universe=df["ticker"].tolist(),
+        universe=tickers,
         ranker=ranker,
         top_n=int(top_n),
         benchmark="SPY",
