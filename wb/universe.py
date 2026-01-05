@@ -8,6 +8,7 @@ import requests
 import streamlit as st
 import yfinance as yf
 
+UNIVERSE_MODULE_VERSION = "2026-01-05_etf_stockanalysis_fallbacks"
 WIKI_SP500 = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 WIKI_NDX = "https://en.wikipedia.org/wiki/Nasdaq-100"
 
