@@ -46,8 +46,12 @@ from wb.snapshots import (
 from wb.causal_ranker import ranker_from_snapshots
 
 # ✅ NEW: decision layer (create wb/decisions.py as provided)
-from wb.decisions import add_decisions_long_term, decision_card
-
+from wb.decisions import (
+    add_decisions_long_term,
+    decision_card,
+    add_decisions_short_term,
+    decision_card_short_term,
+)
 
 st.set_page_config(page_title="Wealth Builder Screener", layout="wide")
 
@@ -401,11 +405,16 @@ if need_recompute:
             st_table_full = apply_short_term_filters(st_table_full, st_params)
             try:
                 st_table_full = classify_setups(st_table_full)
+                st_table_full = add_decisions_short_term(st_table_full, prices)
             except Exception:
                 pass
 
+            st_table_full = add_decisions_short_term(st_table_full, prices)
+
             if "short_score" in st_table_full.columns and "ticker" in st_table_full.columns:
-                st_table_full = st_table_full.sort_values(["short_score", "ticker"], ascending=[False, True]).reset_index(drop=True)
+                st_table_full = st_table_full.sort_values(
+                    ["short_score", "ticker"], ascending=[False, True]
+                ).reset_index(drop=True)
 
             s.update(label="Short-term metrics ready.", state="complete")
 
@@ -449,7 +458,7 @@ if mode == "Short-term":
         view["avg_dollar_vol_20"] = view["avg_dollar_vol_20"].apply(num)
 
     st.dataframe(view, width="stretch", height=380)
-
+    
     st.download_button(
         "Download short-term results CSV",
         data=st_table.to_csv(index=False).encode("utf-8"),
@@ -469,7 +478,13 @@ if mode == "Short-term":
     with c2:
         row = st_table[st_table["ticker"] == pick].iloc[0].to_dict()
         st.metric("Short score", f"{row.get('short_score', 0):.1f}")
-        st.write(row)
+
+        st.subheader("Decision Card")
+        st.write(decision_card_short_term(row))
+
+        with st.expander("Raw metrics (debug)"):
+            st.write(row)
+
 
     st.divider()
     st.subheader("Trade Plan (Position sizing + stops + correlation cap + portfolio heat)")
