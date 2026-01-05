@@ -10,7 +10,7 @@ import pandas as pd
 
 @dataclass(frozen=True)
 class DecisionConfig:
-    # Chase risk thresholds based on % above MA50 (proxy for ~10-week trend)
+    # Chase risk thresholds based on % above MA50 (~10-week proxy)
     chase_green_max: float = 0.10   # <= 10%
     chase_yellow_max: float = 0.25  # 10–25%
 
@@ -23,6 +23,15 @@ class DecisionConfig:
     trail_gain: float = 0.20        # after +20%, trail to MA50 (weekly proxy)
 
 
+def _safe_float(x) -> float:
+    try:
+        if pd.isna(x):
+            return np.nan
+        return float(x)
+    except Exception:
+        return np.nan
+
+
 def _latest_row(prices: pd.DataFrame, ticker: str) -> Optional[pd.Series]:
     g = prices[prices["ticker"] == ticker].sort_values("date")
     if g.empty:
@@ -31,7 +40,10 @@ def _latest_row(prices: pd.DataFrame, ticker: str) -> Optional[pd.Series]:
 
 
 def _weekly_ma(prices: pd.DataFrame, ticker: str, weeks: int = 10) -> float:
-    """Weekly MA from weekly closes (W-FRI), returns latest rolling mean."""
+    """
+    Weekly MA from weekly closes (W-FRI).
+    Uses 'close' column from prices long frame.
+    """
     g = prices[prices["ticker"] == ticker].set_index("date").sort_index()
     if g.empty:
         return np.nan
@@ -51,15 +63,6 @@ def _rolling_max_close(prices: pd.DataFrame, ticker: str, window_days: int = 252
     return float(s.max())
 
 
-def _safe_float(x) -> float:
-    try:
-        if pd.isna(x):
-            return np.nan
-        return float(x)
-    except Exception:
-        return np.nan
-
-
 def chase_risk_label(pct_above_ma50: float, cfg: DecisionConfig) -> str:
     if pd.isna(pct_above_ma50):
         return "—"
@@ -77,10 +80,17 @@ def action_label(
     rs_12m: Optional[float],
     chase_label: str,
 ) -> str:
-    st = str(setup_type or "").strip().lower()
+    """
+    Long-term decision state.
+    BUY: trend confirmed + RS ok + not extended/chase-red
+    WAIT: good name but extended/chase-red
+    WATCH: early/bottom-fishing without full confirmation
+    AVOID: trend broken
+    """
+    stype = str(setup_type or "").strip().lower()
 
     # Hard avoid
-    if st == "avoid":
+    if stype == "avoid":
         return "AVOID"
 
     trend_ok = bool(above_ma200) and bool(above_ma40w)
@@ -89,11 +99,11 @@ def action_label(
     if trend_ok and rs_ok:
         if chase_label.startswith("🔴"):
             return "WAIT"
-        if st == "extended":
+        if stype == "extended":
             return "WAIT"
         return "BUY"
 
-    if st in {"early trend", "bottom-fishing"}:
+    if stype in {"early trend", "bottom-fishing"}:
         return "WATCH"
 
     return "AVOID"
@@ -106,7 +116,7 @@ def build_entry_invalidation_targets(
     cfg: DecisionConfig,
 ) -> Dict[str, str]:
     """
-    Trader-facing guidance (process-based).
+    Trader-facing guidance (process-based). Not predictive.
     """
     out: Dict[str, str] = {}
 
@@ -158,10 +168,13 @@ def add_decisions_long_term(
 ) -> pd.DataFrame:
     """
     Adds decision columns to a long-term metrics/scoring table.
+
     Requires df columns:
-      ticker, setup_type, above_ma200, above_ma40w
+      - ticker
+      - setup_type (from wb.setups)
+      - above_ma200, above_ma40w (from wb.metrics/scoring)
     Optional:
-      rs_vs_spy_12m or rs_12m
+      - rs_vs_spy_12m OR rs_12m
     """
     if df is None or df.empty:
         return df
@@ -217,7 +230,13 @@ def add_decisions_long_term(
     # Action
     rs_vals = out[rs_col] if rs_col else pd.Series([np.nan] * len(out), index=out.index)
     out["action"] = [
-        action_label(setup_type=st, above_ma200=a200, above_ma40w=a40w, rs_12m=(None if rs_col is None else rsv), chase_label=cr)
+        action_label(
+            setup_type=st,
+            above_ma200=a200,
+            above_ma40w=a40w,
+            rs_12m=(None if rs_col is None else rsv),
+            chase_label=cr,
+        )
         for st, a200, a40w, rsv, cr in zip(
             out.get("setup_type", ""),
             out.get("above_ma200", False),
@@ -235,7 +254,7 @@ def add_decisions_long_term(
     card_df = pd.DataFrame(cards)
     out = pd.concat([out.reset_index(drop=True), card_df.reset_index(drop=True)], axis=1)
 
-    # Helpful numeric formatting field
+    # Helpful text field
     out["pct_above_ma50_text"] = np.where(
         out["pct_above_ma50"].notna(),
         (out["pct_above_ma50"] * 100).round(1).astype(str) + "%",
