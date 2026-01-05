@@ -22,6 +22,12 @@ st.caption("Long-term screening: trend health + durability + quality + consisten
 with st.sidebar:
     st.header("Universe")
 
+    mode = st.selectbox("Mode", ["Long-term", "Short-term"], index=0)
+
+    if mode == "Short-term":
+    st.info("Short-term mode is coming next: momentum + liquidity + volatility + catalyst flags + risk rules.")
+    st.stop()
+
     universe_mode = st.selectbox(
         "Pick a universe",
         ["Paste tickers", "Upload CSV", "S&P 500 (Wikipedia)", "Nasdaq 100 (Wikipedia)"],
