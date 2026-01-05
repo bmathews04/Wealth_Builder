@@ -8,7 +8,9 @@ def batch_fetch_prices(tickers, years: int = 5) -> pd.DataFrame:
     Batch fetch daily adjusted OHLCV for many tickers.
     Returns long-form DataFrame:
       date, ticker, open, high, low, close, volume,
-      ma200, ma40w, ret_252d, ret_126d
+      ma20, ma50, ma200, ma40w,
+      ret_21d, ret_63d, ret_126d, ret_252d,
+      avg_dollar_vol_20
     """
     if not tickers:
         return pd.DataFrame()
@@ -36,7 +38,6 @@ def batch_fetch_prices(tickers, years: int = 5) -> pd.DataFrame:
             return pd.DataFrame()
         out = pd.concat(frames).reset_index().rename(columns={"Date": "date"})
     else:
-        # single ticker
         out = df[["Open", "High", "Low", "Close", "Volume"]].copy()
         out.columns = ["open", "high", "low", "close", "volume"]
         out = out.reset_index().rename(columns={"Date": "date"})
@@ -46,6 +47,8 @@ def batch_fetch_prices(tickers, years: int = 5) -> pd.DataFrame:
 
     def add_ind(g: pd.DataFrame) -> pd.DataFrame:
         g = g.copy()
+        g["ma20"] = g["close"].rolling(20).mean()
+        g["ma50"] = g["close"].rolling(50).mean()
         g["ma200"] = g["close"].rolling(200).mean()
 
         # Weekly 40W MA computed from weekly closes
@@ -55,8 +58,15 @@ def batch_fetch_prices(tickers, years: int = 5) -> pd.DataFrame:
         g["ma40w"] = ma40w.reindex(g.index, method="ffill")
         g = g.reset_index()
 
-        g["ret_252d"] = g["close"].pct_change(252)
+        g["ret_21d"] = g["close"].pct_change(21)
+        g["ret_63d"] = g["close"].pct_change(63)
         g["ret_126d"] = g["close"].pct_change(126)
+        g["ret_252d"] = g["close"].pct_change(252)
+
+        # Avg dollar volume (20d): close * volume
+        dv = g["close"] * g["volume"]
+        g["avg_dollar_vol_20"] = dv.rolling(20).mean()
+
         return g
 
     out = out.groupby("ticker", group_keys=False).apply(add_ind)
