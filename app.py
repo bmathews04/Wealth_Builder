@@ -45,13 +45,14 @@ from wb.snapshots import (
 )
 from wb.causal_ranker import ranker_from_snapshots
 
-# ✅ NEW: decision layer (create wb/decisions.py as provided)
+# ✅ Decision layer
 from wb.decisions import (
     add_decisions_long_term,
     decision_card,
     add_decisions_short_term,
     decision_card_short_term,
 )
+
 
 st.set_page_config(page_title="Wealth Builder Screener", layout="wide")
 
@@ -373,7 +374,7 @@ if need_recompute:
             df_full = add_data_quality_badges(df_full)
             df_full = classify_setups(df_full)
 
-            # ✅ add trader decision layer (Action / Chase risk / Entries / Invalidation / Management)
+            # ✅ NEW: add long-term decision layer
             df_full = add_decisions_long_term(df_full, prices)
 
             # Stable ranking (important!)
@@ -405,10 +406,10 @@ if need_recompute:
             st_table_full = apply_short_term_filters(st_table_full, st_params)
             try:
                 st_table_full = classify_setups(st_table_full)
-                st_table_full = add_decisions_short_term(st_table_full, prices)
             except Exception:
                 pass
 
+            # ✅ NEW: add short-term decision layer
             st_table_full = add_decisions_short_term(st_table_full, prices)
 
             if "short_score" in st_table_full.columns and "ticker" in st_table_full.columns:
@@ -450,6 +451,24 @@ if mode == "Short-term":
         st.warning("No tickers match your setup filter.")
         st.stop()
 
+    # ✅ Actionable view first
+    st.subheader("Actionable short-term list")
+    primary_cols = [
+        "ticker",
+        "st_action",
+        "st_chase_risk",
+        "setup_type",
+        "short_score",
+        "st_pct_above_ma20_text",
+        "dist_from_52w_high",
+        "max_drawdown_6m",
+        "avg_dollar_vol_20",
+    ]
+    show_cols = [c for c in primary_cols if c in st_table.columns]
+    st.dataframe(st_table[show_cols], width="stretch", height=380)
+
+    # Full table (formatted)
+    st.caption("Full table (all metrics)")
     view = st_table.copy()
     for col in ["mom_1m", "mom_3m", "mom_6m", "mom_12m", "dist_from_52w_high", "max_drawdown_6m"]:
         if col in view.columns:
@@ -458,7 +477,7 @@ if mode == "Short-term":
         view["avg_dollar_vol_20"] = view["avg_dollar_vol_20"].apply(num)
 
     st.dataframe(view, width="stretch", height=380)
-    
+
     st.download_button(
         "Download short-term results CSV",
         data=st_table.to_csv(index=False).encode("utf-8"),
@@ -484,7 +503,6 @@ if mode == "Short-term":
 
         with st.expander("Raw metrics (debug)"):
             st.write(row)
-
 
     st.divider()
     st.subheader("Trade Plan (Position sizing + stops + correlation cap + portfolio heat)")
@@ -572,7 +590,10 @@ if mode == "Short-term":
         if "error" in res.stats:
             st.error(res.stats["error"])
         else:
-            st.plotly_chart(equity_curve_chart(res.equity_curve, f"Buy & Hold Top {top_n} vs SPY"), use_container_width=True)
+            st.plotly_chart(
+                equity_curve_chart(res.equity_curve, f"Buy & Hold Top {top_n} vs SPY"),
+                use_container_width=True,
+            )
             st.write(res.stats)
     else:
         mom_choice = st.selectbox("Momentum lookback", ["3M", "6M", "12M"], index=1)
@@ -610,7 +631,10 @@ if mode == "Short-term":
         if "error" in rb2.stats:
             st.error(rb2.stats["error"])
         else:
-            st.plotly_chart(equity_curve_chart(rb2.equity_curve, f"Rebalanced v2 ({rb_freq}) Top {top_n} vs SPY"), use_container_width=True)
+            st.plotly_chart(
+                equity_curve_chart(rb2.equity_curve, f"Rebalanced v2 ({rb_freq}) Top {top_n} vs SPY"),
+                use_container_width=True,
+            )
             st.write(rb2.stats)
 
     st.stop()
@@ -638,6 +662,7 @@ if df_view.empty:
     st.stop()
 
 # ✅ Actionable top table
+st.subheader("Actionable long-term list")
 primary_cols = [
     "ticker",
     "action",
@@ -667,7 +692,6 @@ with c2:
     row = df_view[df_view["ticker"] == pick].iloc[0].to_dict()
     st.metric("Score", f"{row.get('score', 0):.1f}")
 
-    # ✅ Decision card
     st.subheader("Decision Card")
     st.write(decision_card(row))
 
@@ -700,7 +724,10 @@ if bt_mode == "Buy & Hold":
     if "error" in res.stats:
         st.error(res.stats["error"])
     else:
-        st.plotly_chart(equity_curve_chart(res.equity_curve, f"Buy & Hold Top {top_n} vs SPY"), use_container_width=True)
+        st.plotly_chart(
+            equity_curve_chart(res.equity_curve, f"Buy & Hold Top {top_n} vs SPY"),
+            use_container_width=True,
+        )
         st.write(res.stats)
 
 else:
