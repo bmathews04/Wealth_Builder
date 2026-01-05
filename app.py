@@ -25,17 +25,25 @@ from wb.short_term import (
 )
 
 from wb.backtest import backtest_equal_weight, equity_curve_chart
-from wb.backtest_rebalance import backtest_monthly_rebalanced, equity_curve_chart as equity_curve_chart_reb
+from wb.backtest_rebalance import backtest_monthly_rebalanced
+from wb.backtest_rebalance_v2 import backtest_rebalanced_v2
+
 from wb.risk import RiskParams, build_trade_plan
+from wb.risk_v2 import (
+    correlation_filter,
+    portfolio_heat,
+    enforce_heat_cap,
+)
 
 
 st.set_page_config(page_title="Wealth Builder Screener", layout="wide")
 
 st.title("Wealth Builder Screener")
-st.caption("Mode toggle: Long-term (durability) vs Short-term (momentum). Backtest + risk module included.")
+st.caption("Mode toggle: Long-term (durability) vs Short-term (momentum). Backtests + risk tools included.")
+
 
 # ----------------------------
-# Sidebar
+# Sidebar: Universe + Global perf
 # ----------------------------
 with st.sidebar:
     st.header("Mode")
@@ -77,7 +85,10 @@ with st.sidebar:
     throttle_safe_mode = st.checkbox("Throttle-safe mode", value=False)
     st.caption("If screening large universes and seeing missing fundamentals, enable this.")
 
-# Clean tickers
+
+# ----------------------------
+# Clean tickers + fetch prices (always)
+# ----------------------------
 if tickers:
     tickers = [t for t in tickers if t and isinstance(t, str)]
     tickers = sorted(list(dict.fromkeys([t.strip().upper() for t in tickers if t.strip()])))
@@ -91,9 +102,6 @@ st.write(f"Universe size: **{len(tickers)}**")
 # Always include SPY for RS + benchmark backtests
 tickers_for_prices = sorted(list(dict.fromkeys(tickers + ["SPY"])))
 
-# ----------------------------
-# Fetch prices
-# ----------------------------
 with st.status("Fetching price data (batch)…", expanded=False) as s:
     prices = batch_fetch_prices(tickers_for_prices, years=5)
     s.update(label="Price data loaded.", state="complete")
@@ -102,11 +110,13 @@ if prices.empty:
     st.error("No price data returned. Check tickers or data source.")
     st.stop()
 
+
 # ----------------------------
 # Utilities
 # ----------------------------
 def pct(x):
     return "—" if pd.isna(x) else f"{x * 100:.1f}%"
+
 
 def num(x):
     if pd.isna(x):
@@ -120,20 +130,19 @@ def num(x):
         return f"{x/1e3:.1f}K"
     return f"{x:.0f}"
 
+
 def truthy_badge(x):
     return "✅" if bool(x) else "—"
 
+
 def _latest_snapshot_asof(prices_long: pd.DataFrame, asof: pd.Timestamp) -> pd.DataFrame:
-    """
-    Returns one row per ticker: the latest row with date <= asof.
-    Requires long prices with columns including date,ticker and computed indicators/returns.
-    """
     d = prices_long[prices_long["date"] <= pd.to_datetime(asof)].copy()
     if d.empty:
         return pd.DataFrame()
     d = d.sort_values(["ticker", "date"])
     snap = d.groupby("ticker", as_index=False).tail(1)
     return snap
+
 
 def _causal_momentum_ranker_factory(
     prices_long: pd.DataFrame,
@@ -143,41 +152,36 @@ def _causal_momentum_ranker_factory(
     require_above_ma50: bool = True,
     require_above_ma200: bool = False,
 ):
-    """
-    ranker(date)->list[ticker] that ranks by momentum_col using only data up to date.
-    Uses liquidity (avg_dollar_vol_20) and optional trend requirements (ma50/ma200).
-    """
     def ranker(asof: pd.Timestamp) -> list[str]:
         snap = _latest_snapshot_asof(prices_long, asof)
         if snap.empty:
             return []
+
         snap = snap[snap["ticker"].isin(universe)].copy()
 
-        # Liquidity
         if "avg_dollar_vol_20" in snap.columns:
             snap = snap[snap["avg_dollar_vol_20"].fillna(0) >= float(min_adv)]
 
-        # Trend constraints
         if require_above_ma50 and ("ma50" in snap.columns):
             snap = snap[(snap["close"] > snap["ma50"]) & snap["ma50"].notna()]
         if require_above_ma200 and ("ma200" in snap.columns):
             snap = snap[(snap["close"] > snap["ma200"]) & snap["ma200"].notna()]
 
-        # Momentum
         if momentum_col not in snap.columns:
             return []
-        snap = snap[snap[momentum_col].notna()]
-        snap = snap.sort_values(momentum_col, ascending=False)
 
+        snap = snap[snap[momentum_col].notna()].sort_values(momentum_col, ascending=False)
         return snap["ticker"].astype(str).tolist()
+
     return ranker
 
-# ----------------------------
+
+# ============================
 # SHORT-TERM MODE
-# ----------------------------
+# ============================
 if mode == "Short-term":
     st.subheader("Short-term Screener (Momentum + Trend + Liquidity)")
-    st.caption("Short-term = momentum/trend + liquidity + controlled drawdowns + position plan.")
+    st.caption("Short-term = momentum/trend + liquidity + controlled drawdowns + trade plan + portfolio heat.")
 
     with st.sidebar:
         st.header("Short-term filters")
@@ -246,6 +250,7 @@ if mode == "Short-term":
         mime="text/csv",
     )
 
+    # ---- Deep dive charts ----
     st.subheader("Deep dive")
     pick = st.selectbox("Select a ticker", st_table["ticker"].tolist(), index=0)
 
@@ -273,12 +278,13 @@ if mode == "Short-term":
         )
 
     # ----------------------------
-    # Risk module: trade plan
+    # Risk module v2: correlation cap + portfolio heat
     # ----------------------------
     st.divider()
-    st.subheader("Trade Plan (Position sizing + stops)")
+    st.subheader("Trade Plan (Position sizing + stops + correlation cap + portfolio heat)")
 
-    rp_col1, rp_col2 = st.columns(2)
+    rp_col1, rp_col2, rp_col3 = st.columns(3)
+
     with rp_col1:
         account_size = st.number_input("Account size ($)", value=10_000.0, step=1_000.0)
         risk_pct = st.slider("Risk per trade (%)", 0.1, 5.0, 1.0, 0.1) / 100.0
@@ -288,7 +294,14 @@ if mode == "Short-term":
         stop_type = st.selectbox("Stop type", ["ATR", "PCT"], index=0)
         atr_mult = st.slider("ATR multiple", 1.0, 5.0, 2.0, 0.1)
         pct_stop = st.slider("Percent stop", 0.01, 0.30, 0.08, 0.01)
+
+    with rp_col3:
         vol_target = st.slider("Vol target (annual) for sizing", 0.05, 0.60, 0.20, 0.01)
+        heat_cap_pct = st.slider("Portfolio heat cap (%)", 1.0, 20.0, 6.0, 0.5) / 100.0
+        use_corr_cap = st.checkbox("Use correlation cap", value=True)
+
+    corr_lookback = st.slider("Correlation lookback (days)", 30, 252, 126, 7)
+    max_pair_corr = st.slider("Max pair correlation", 0.10, 0.99, 0.75, 0.01)
 
     plan_params = RiskParams(
         account_size=float(account_size),
@@ -300,15 +313,39 @@ if mode == "Short-term":
         vol_target_annual=float(vol_target),
     )
 
-    plan_top_n = st.slider("Build plan from Top N short-term names", 3, min(25, len(st_table)), 10, 1)
-    plan_tickers = st_table.head(plan_top_n)["ticker"].tolist()
+    plan_from_n = st.slider("Build plan from top N short-term names", 3, min(60, len(st_table)), 25, 1)
+    ranked_for_plan = st_table.head(plan_from_n)["ticker"].tolist()
 
-    trade_plan = build_trade_plan(prices, plan_tickers, plan_params)
+    if use_corr_cap:
+        plan_universe = correlation_filter(
+            prices=prices,
+            ranked_tickers=ranked_for_plan,
+            lookback_days=int(corr_lookback),
+            max_pair_corr=float(max_pair_corr),
+            max_n=int(max_pos),
+        )
+        st.caption(f"Correlation cap selected **{len(plan_universe)}** names out of {min(plan_from_n, len(st_table))}.")
+    else:
+        plan_universe = ranked_for_plan[: int(max_pos)]
+
+    trade_plan_raw = build_trade_plan(prices, plan_universe, plan_params)
+    trade_plan = enforce_heat_cap(trade_plan_raw, float(account_size), float(heat_cap_pct))
+
+    heat = portfolio_heat(trade_plan, float(account_size))
+    hc1, hc2, hc3 = st.columns(3)
+    with hc1:
+        st.metric("Portfolio heat", f"{heat['heat_pct']*100:.2f}%")
+    with hc2:
+        st.metric("Risk dollars (sum)", f"${heat['risk_dollars']:.2f}")
+    with hc3:
+        st.metric("Heat cap", f"{heat_cap_pct*100:.2f}%")
 
     tp = trade_plan.copy()
-    for col in ["stop_pct", "position_pct"]:
-        if col in tp.columns:
-            tp[col] = tp[col].apply(lambda v: "—" if pd.isna(v) else f"{v*100:.1f}%")
+    if "stop_pct" in tp.columns:
+        tp["stop_pct"] = tp["stop_pct"].apply(lambda v: "—" if pd.isna(v) else f"{v*100:.1f}%")
+    if "position_pct" in tp.columns:
+        tp["position_pct"] = tp["position_pct"].apply(lambda v: "—" if pd.isna(v) else f"{v*100:.1f}%")
+
     for col in ["entry", "stop", "risk_per_share", "position_value"]:
         if col in tp.columns:
             tp[col] = tp[col].apply(lambda v: "—" if pd.isna(v) else round(float(v), 2))
@@ -316,7 +353,7 @@ if mode == "Short-term":
         if col in tp.columns:
             tp[col] = tp[col].apply(lambda v: "—" if pd.isna(v) else round(float(v), 4))
 
-    st.dataframe(tp, use_container_width=True, height=320)
+    st.dataframe(tp, use_container_width=True, height=340)
 
     st.download_button(
         "Download trade plan CSV",
@@ -326,12 +363,17 @@ if mode == "Short-term":
     )
 
     # ----------------------------
-    # Backtest
+    # Backtests (Short-term): Buy&Hold OR Rebalanced v2 (causal + costs + weekly/monthly)
     # ----------------------------
     st.divider()
     st.subheader("Backtest (Top-N vs SPY)")
 
-    bt_mode = st.selectbox("Backtest mode", ["Buy & Hold", "Monthly Rebalance (Causal Momentum)"], index=0)
+    bt_mode = st.selectbox(
+        "Backtest mode",
+        ["Buy & Hold", "Rebalanced v2 (Causal Momentum + Costs)"],
+        index=0,
+    )
+
     top_n = st.slider("Top N", 5, min(50, len(st_table)), 10, 1)
 
     start = st.date_input("Start date", value=pd.Timestamp.today() - pd.Timedelta(days=365 * 3))
@@ -343,10 +385,7 @@ if mode == "Short-term":
         if "error" in res.stats:
             st.error(res.stats["error"])
         else:
-            st.plotly_chart(
-                equity_curve_chart(res.equity_curve, f"Buy & Hold Top {top_n} vs SPY"),
-                use_container_width=True,
-            )
+            st.plotly_chart(equity_curve_chart(res.equity_curve, f"Buy & Hold Top {top_n} vs SPY"), use_container_width=True)
             st.write(res.stats)
 
     else:
@@ -354,10 +393,13 @@ if mode == "Short-term":
         mom_map = {"3M": "ret_63d", "6M": "ret_126d", "12M": "ret_252d"}
         mom_col = mom_map[mom_choice]
 
-        use_vol_target = st.checkbox("Use volatility targeting (portfolio)", value=False)
-        target_vol = st.slider("Target annual vol", 0.05, 0.60, 0.20, 0.01)
-        max_lev = st.slider("Max leverage", 1.0, 3.0, 1.5, 0.1)
+        rb_freq = st.selectbox("Rebalance frequency", ["Monthly", "Weekly"], index=0)
+        rb_code = "M" if rb_freq == "Monthly" else "W"
 
+        fee_bps = st.slider("Transaction cost (bps)", 0.0, 50.0, 5.0, 0.5)
+        skip_overlap = st.slider("Skip rebalance if overlap ≥", 0.0, 0.99, 0.70, 0.01)
+
+        # Causal ranker: computed as-of each rebalance date
         ranker = _causal_momentum_ranker_factory(
             prices_long=prices,
             universe=tickers,
@@ -367,35 +409,41 @@ if mode == "Short-term":
             require_above_ma200=bool(require_ma200),
         )
 
-        rb = backtest_monthly_rebalanced(
+        rb2 = backtest_rebalanced_v2(
             prices=prices,
             universe=tickers,
             ranker=ranker,
-            top_n=top_n,
+            top_n=int(top_n),
             benchmark="SPY",
             start=str(start),
             end=str(end),
-            use_vol_target=use_vol_target,
-            target_annual_vol=target_vol,
-            max_leverage=max_lev,
+            rebalance=rb_code,
+            fee_bps=float(fee_bps),
+            skip_if_overlap_pct=float(skip_overlap),
         )
 
-        if "error" in rb.stats:
-            st.error(rb.stats["error"])
+        if "error" in rb2.stats:
+            st.error(rb2.stats["error"])
         else:
             st.plotly_chart(
-                equity_curve_chart_reb(rb.equity_curve, f"Monthly Rebalance (Causal) Top {top_n} vs SPY"),
+                equity_curve_chart(rb2.equity_curve, f"Rebalanced v2 ({rb_freq}) Top {top_n} vs SPY"),
                 use_container_width=True,
             )
-            st.write(rb.stats)
-            with st.expander("Holdings (weights by rebalance date)"):
-                st.dataframe(rb.holdings, use_container_width=True, height=260)
+            st.write(rb2.stats)
+            cta, ctb = st.columns(2)
+            with cta:
+                with st.expander("Holdings (weights by rebalance date)"):
+                    st.dataframe(rb2.holdings, use_container_width=True, height=260)
+            with ctb:
+                with st.expander("Turnover & costs by rebalance date"):
+                    st.dataframe(rb2.trades, use_container_width=True, height=260)
 
     st.stop()
 
-# ----------------------------
+
+# ============================
 # LONG-TERM MODE
-# ----------------------------
+# ============================
 st.subheader("Long-term Screener (Durability + Consistency + Trend)")
 
 with st.sidebar:
@@ -423,7 +471,6 @@ with st.sidebar:
     min_rs_12m = st.slider("Min RS vs SPY (12m)", -0.50, 1.00, 0.00, 0.01)
     max_drawdown_2y = st.slider("Max drawdown (2y)", 0.10, 0.90, 0.50, 0.01)
 
-# Fundamentals fetch only in long-term mode
 with st.status("Fetching fundamentals + metadata (parallel)…", expanded=False) as s:
     workers = min(max_workers, 8) if throttle_safe_mode else max_workers
     fundamentals = fetch_fundamentals_parallel(tickers, max_workers=workers)
@@ -463,22 +510,42 @@ df = df[df["max_drawdown_2y"].fillna(999) <= max_drawdown_2y]
 st.subheader("Ranked results")
 
 display_cols = [
-    "ticker", "sector", "industry", "data_quality", "score",
-    "rev_cagr_3y", "gross_margin", "op_margin",
-    "fcf_ttm", "fcf_margin",
-    "debt_to_equity", "sbc_pct_rev",
-    "shares_change_3y", "roic_proxy",
-    "fcf_pos_years_5", "gm_floor_years_5", "rev_up_years_5",
-    "rs_vs_spy_12m", "max_drawdown_2y",
-    "above_ma200", "above_ma40w",
+    "ticker",
+    "sector",
+    "industry",
+    "data_quality",
+    "score",
+    "rev_cagr_3y",
+    "gross_margin",
+    "op_margin",
+    "fcf_ttm",
+    "fcf_margin",
+    "debt_to_equity",
+    "sbc_pct_rev",
+    "shares_change_3y",
+    "roic_proxy",
+    "fcf_pos_years_5",
+    "gm_floor_years_5",
+    "rev_up_years_5",
+    "rs_vs_spy_12m",
+    "max_drawdown_2y",
+    "above_ma200",
+    "above_ma40w",
 ]
 
 disp = df[display_cols].sort_values(["score"], ascending=False).reset_index(drop=True)
 pretty = disp.copy()
 
 for col in [
-    "rev_cagr_3y", "gross_margin", "op_margin", "fcf_margin", "sbc_pct_rev",
-    "shares_change_3y", "roic_proxy", "rs_vs_spy_12m", "max_drawdown_2y"
+    "rev_cagr_3y",
+    "gross_margin",
+    "op_margin",
+    "fcf_margin",
+    "sbc_pct_rev",
+    "shares_change_3y",
+    "roic_proxy",
+    "rs_vs_spy_12m",
+    "max_drawdown_2y",
 ]:
     pretty[col] = pretty[col].apply(pct)
 
@@ -500,6 +567,7 @@ if df.empty:
     st.warning("No tickers passed your filters. Loosen filters or change universe.")
     st.stop()
 
+# ---- Deep dive ----
 st.subheader("Deep dive")
 pick = st.selectbox("Select a ticker", df.sort_values("score", ascending=False)["ticker"].tolist(), index=0)
 
@@ -542,13 +610,15 @@ with t1:
 with t2:
     st.plotly_chart(make_cashflow_trends(fundamentals, pick), use_container_width=True)
 
-# ----------------------------
-# Long-term backtest: buy&hold OR monthly rebalance (static ranks)
-# ----------------------------
+# ---- Backtests (Long-term): Buy&Hold OR Rebalanced v2 (static ranks + costs) ----
 st.divider()
 st.subheader("Backtest (Top-N vs SPY)")
 
-bt_mode = st.selectbox("Backtest mode", ["Buy & Hold", "Monthly Rebalance (Static Long-term Ranks)"], index=0)
+bt_mode = st.selectbox(
+    "Backtest mode",
+    ["Buy & Hold", "Rebalanced v2 (Static Long-term Ranks + Costs)"],
+    index=0,
+)
 top_n = st.slider("Top N", 5, min(50, len(df)), 10, 1)
 
 start = st.date_input("Start date", value=pd.Timestamp.today() - pd.Timedelta(days=365 * 5))
@@ -557,48 +627,50 @@ end = st.date_input("End date", value=pd.Timestamp.today())
 if bt_mode == "Buy & Hold":
     bt_tickers = df.sort_values("score", ascending=False).head(top_n)["ticker"].tolist()
     res = backtest_equal_weight(prices, bt_tickers, benchmark="SPY", start=str(start), end=str(end))
-
     if "error" in res.stats:
         st.error(res.stats["error"])
     else:
-        st.plotly_chart(
-            equity_curve_chart(res.equity_curve, f"Buy & Hold Top {top_n} vs SPY"),
-            use_container_width=True,
-        )
+        st.plotly_chart(equity_curve_chart(res.equity_curve, f"Buy & Hold Top {top_n} vs SPY"), use_container_width=True)
         st.write(res.stats)
 
 else:
-    st.caption("Note: Long-term monthly rebalance uses today's fundamental ranks at every rebalance (static).")
+    st.caption("Note: This rebalance uses today's long-term ranks at every rebalance (static).")
+    rb_freq = st.selectbox("Rebalance frequency", ["Monthly", "Weekly"], index=0)
+    rb_code = "M" if rb_freq == "Monthly" else "W"
 
-    use_vol_target = st.checkbox("Use volatility targeting (portfolio)", value=False)
-    target_vol = st.slider("Target annual vol", 0.05, 0.60, 0.20, 0.01)
-    max_lev = st.slider("Max leverage", 1.0, 3.0, 1.5, 0.1)
+    fee_bps = st.slider("Transaction cost (bps)", 0.0, 50.0, 5.0, 0.5)
+    skip_overlap = st.slider("Skip rebalance if overlap ≥", 0.0, 0.99, 0.70, 0.01)
 
     ranked = df.sort_values("score", ascending=False)["ticker"].tolist()
 
-    def ranker(_date):
+    def ranker(_asof: pd.Timestamp) -> list[str]:
         return ranked
 
-    rb = backtest_monthly_rebalanced(
+    rb2 = backtest_rebalanced_v2(
         prices=prices,
         universe=df["ticker"].tolist(),
         ranker=ranker,
-        top_n=top_n,
+        top_n=int(top_n),
         benchmark="SPY",
         start=str(start),
         end=str(end),
-        use_vol_target=use_vol_target,
-        target_annual_vol=target_vol,
-        max_leverage=max_lev,
+        rebalance=rb_code,
+        fee_bps=float(fee_bps),
+        skip_if_overlap_pct=float(skip_overlap),
     )
 
-    if "error" in rb.stats:
-        st.error(rb.stats["error"])
+    if "error" in rb2.stats:
+        st.error(rb2.stats["error"])
     else:
         st.plotly_chart(
-            equity_curve_chart_reb(rb.equity_curve, f"Monthly Rebalance Top {top_n} vs SPY"),
+            equity_curve_chart(rb2.equity_curve, f"Rebalanced v2 ({rb_freq}) Top {top_n} vs SPY"),
             use_container_width=True,
         )
-        st.write(rb.stats)
-        with st.expander("Holdings (weights by rebalance date)"):
-            st.dataframe(rb.holdings, use_container_width=True, height=260)
+        st.write(rb2.stats)
+        cta, ctb = st.columns(2)
+        with cta:
+            with st.expander("Holdings (weights by rebalance date)"):
+                st.dataframe(rb2.holdings, use_container_width=True, height=260)
+        with ctb:
+            with st.expander("Turnover & costs by rebalance date"):
+                st.dataframe(rb2.trades, use_container_width=True, height=260)
