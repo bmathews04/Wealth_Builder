@@ -275,3 +275,252 @@ def decision_card(row: Dict) -> Dict[str, str]:
         "Invalidation": row.get("invalidation", "—"),
         "Management": row.get("management", "—"),
     }
+
+# =========================
+# SHORT-TERM DECISION LAYER
+# =========================
+
+def _get_last_price_row(prices: pd.DataFrame, ticker: str) -> Optional[pd.Series]:
+    g = prices[prices["ticker"] == ticker].sort_values("date")
+    if g.empty:
+        return None
+    return g.iloc[-1]
+
+
+def _fmt_price(x) -> str:
+    return "—" if pd.isna(x) else f"${float(x):,.2f}"
+
+
+def _fmt_pct(x) -> str:
+    return "—" if pd.isna(x) else f"{float(x)*100:.1f}%"
+
+
+def short_term_chase_risk(
+    pct_above_ma20: float,
+    dist_from_52w_high: float,
+) -> str:
+    """
+    Two quick 'don't chase' signals:
+    - too extended above MA20
+    - too close to 52w highs (breakout is fine; chasing is not)
+    """
+    if pd.isna(pct_above_ma20) and pd.isna(dist_from_52w_high):
+        return "—"
+
+    # If either is missing, decide from what we have
+    pa = pct_above_ma20
+    d52 = dist_from_52w_high
+
+    # Conservative: if very extended or at highs -> high chase risk
+    if (not pd.isna(pa) and pa >= 0.12) or (not pd.isna(d52) and d52 <= 0.05):
+        return "🔴 High"
+    if (not pd.isna(pa) and pa >= 0.06) or (not pd.isna(d52) and d52 <= 0.12):
+        return "🟡 Medium"
+    return "🟢 Low"
+
+
+def short_term_action(
+    above_ma50: Optional[bool],
+    mom_3m: Optional[float],
+    mom_6m: Optional[float],
+    max_dd_6m: Optional[float],
+    chase_label: str,
+) -> str:
+    """
+    Short-term is more tactical:
+      BUY  = trend + momentum + not too ugly dd + not chase-red
+      WAIT = good momentum but chase-red / too extended
+      WATCH = improving but not fully confirmed
+      AVOID = trend broken
+    """
+    if above_ma50 is False:
+        return "AVOID"
+
+    m3 = np.nan if mom_3m is None else float(mom_3m)
+    m6 = np.nan if mom_6m is None else float(mom_6m)
+    dd = np.nan if max_dd_6m is None else float(max_dd_6m)
+
+    mom_ok = (not pd.isna(m3) and m3 > 0) and (not pd.isna(m6) and m6 > 0)
+    dd_ok = (pd.isna(dd) or dd <= 0.45)
+
+    if above_ma50 and mom_ok and dd_ok:
+        if chase_label.startswith("🔴"):
+            return "WAIT"
+        return "BUY"
+
+    # If above MA50 but momentum mixed -> WATCH
+    if above_ma50:
+        return "WATCH"
+
+    return "AVOID"
+
+
+def build_short_term_plan_text(
+    close: float,
+    ma20: float,
+    ma50: float,
+    high_52w: float,
+    cfg: DecisionConfig,
+) -> Dict[str, str]:
+    """
+    Practical, process-based suggestions (not predictive):
+    - Entries: pullback to MA20/MA50 or breakout above 52w high
+    - Stops: tactical under MA50 (or MA20 for tighter)
+    - Targets: optional 'prior high' / '2R' language kept simple
+    """
+    out: Dict[str, str] = {}
+
+    # Entry: MA20 pullback
+    if not pd.isna(ma20):
+        out["st_entry_pullback"] = f"Pullback entry: {_fmt_price(ma20)} to {_fmt_price(ma20 * 1.02)} (MA20 to +2%)"
+    else:
+        out["st_entry_pullback"] = "Pullback entry: —"
+
+    # Entry: MA50 support
+    if not pd.isna(ma50):
+        out["st_entry_support"] = f"Support entry: {_fmt_price(ma50)} to {_fmt_price(ma50 * 1.03)} (MA50 to +3%)"
+    else:
+        out["st_entry_support"] = "Support entry: —"
+
+    # Entry: breakout
+    if not pd.isna(high_52w):
+        out["st_entry_breakout"] = f"Breakout entry: weekly close above {_fmt_price(high_52w)} (52w high)"
+    else:
+        out["st_entry_breakout"] = "Breakout entry: —"
+
+    # Stops
+    if not pd.isna(ma50):
+        out["st_stop"] = f"Stop idea: close below MA50 ({_fmt_price(ma50)})"
+    elif not pd.isna(ma20):
+        out["st_stop"] = f"Stop idea: close below MA20 ({_fmt_price(ma20)})"
+    else:
+        out["st_stop"] = "Stop idea: —"
+
+    # Simple target framing
+    if not pd.isna(high_52w) and not pd.isna(close):
+        # if below highs, target is retest
+        if close < high_52w:
+            out["st_target"] = f"Target idea: retest {_fmt_price(high_52w)} (prior high)"
+        else:
+            out["st_target"] = "Target idea: trail winners (raise stop with MA20/MA50)"
+    else:
+        out["st_target"] = "Target idea: —"
+
+    return out
+
+
+def add_decisions_short_term(
+    st_df: pd.DataFrame,
+    prices: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Adds actionable short-term decision columns to the short-term table.
+
+    Expects st_df columns from wb.short_term.compute_short_term_table:
+      ticker, close, mom_3m, mom_6m, above_ma50, dist_from_52w_high, max_drawdown_6m, etc.
+
+    Uses prices (long form) to fetch ma20/ma50 and 52w high for text guidance.
+    """
+    if st_df is None or st_df.empty:
+        return st_df
+
+    out = st_df.copy()
+
+    # Pull MA levels + 52w highs for each ticker
+    rows = []
+    for t in out["ticker"].astype(str).tolist():
+        last = _get_last_price_row(prices, t)
+        if last is None:
+            rows.append(
+                dict(
+                    ticker=t,
+                    st_ma20=np.nan,
+                    st_ma50=np.nan,
+                    st_high_52w=np.nan,
+                    st_pct_above_ma20=np.nan,
+                )
+            )
+            continue
+
+        close = _safe_float(last.get("close"))
+        ma20 = _safe_float(last.get("ma20"))
+        ma50 = _safe_float(last.get("ma50"))
+
+        high_52w = _rolling_max_close(prices, t, window_days=252)
+
+        pct_above_ma20 = np.nan
+        if not pd.isna(close) and not pd.isna(ma20) and ma20 != 0:
+            pct_above_ma20 = (close / ma20) - 1.0
+
+        rows.append(
+            dict(
+                ticker=t,
+                st_ma20=ma20,
+                st_ma50=ma50,
+                st_high_52w=high_52w,
+                st_pct_above_ma20=pct_above_ma20,
+            )
+        )
+
+    aux = pd.DataFrame(rows)
+    out = out.merge(aux, on="ticker", how="left")
+
+    # Chase risk
+    out["st_chase_risk"] = [
+        short_term_chase_risk(pa, d52)
+        for pa, d52 in zip(out["st_pct_above_ma20"], out.get("dist_from_52w_high", pd.Series([np.nan] * len(out))))
+    ]
+
+    # Action
+    out["st_action"] = [
+        short_term_action(a50, m3, m6, dd6, cr)
+        for a50, m3, m6, dd6, cr in zip(
+            out.get("above_ma50", pd.Series([None] * len(out))),
+            out.get("mom_3m", pd.Series([None] * len(out))),
+            out.get("mom_6m", pd.Series([None] * len(out))),
+            out.get("max_drawdown_6m", pd.Series([None] * len(out))),
+            out["st_chase_risk"],
+        )
+    ]
+
+    # Plan text fields
+    plans = [
+        build_short_term_plan_text(
+            close=_safe_float(c),
+            ma20=_safe_float(ma20),
+            ma50=_safe_float(ma50),
+            high_52w=_safe_float(h52),
+            cfg=DecisionConfig(),
+        )
+        for c, ma20, ma50, h52 in zip(
+            out.get("close", pd.Series([np.nan] * len(out))),
+            out["st_ma20"],
+            out["st_ma50"],
+            out["st_high_52w"],
+        )
+    ]
+    plan_df = pd.DataFrame(plans)
+    out = pd.concat([out.reset_index(drop=True), plan_df.reset_index(drop=True)], axis=1)
+
+    # Helpful text columns for table
+    out["st_pct_above_ma20_text"] = np.where(
+        out["st_pct_above_ma20"].notna(),
+        (out["st_pct_above_ma20"] * 100).round(1).astype(str) + "%",
+        "—",
+    )
+
+    return out
+
+
+def decision_card_short_term(row: Dict) -> Dict[str, str]:
+    return {
+        "Action": row.get("st_action", "—"),
+        "Chase risk": row.get("st_chase_risk", "—"),
+        "Pullback entry (MA20)": row.get("st_entry_pullback", "—"),
+        "Support entry (MA50)": row.get("st_entry_support", "—"),
+        "Breakout entry": row.get("st_entry_breakout", "—"),
+        "Stop idea": row.get("st_stop", "—"),
+        "Target idea": row.get("st_target", "—"),
+    }
+
+
