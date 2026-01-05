@@ -45,6 +45,9 @@ from wb.snapshots import (
 )
 from wb.causal_ranker import ranker_from_snapshots
 
+# ✅ NEW: decision layer (create wb/decisions.py as provided)
+from wb.decisions import add_decisions_long_term, decision_card
+
 
 st.set_page_config(page_title="Wealth Builder Screener", layout="wide")
 
@@ -143,36 +146,40 @@ def _causal_momentum_ranker_factory(
 def parse_tickers_from_inputs(universe_mode: str, tickers_text: str | None, uploaded) -> tuple[list[str], str | None]:
     tickers: list[str] = []
 
-    if universe_mode == "Paste tickers":
-        if tickers_text:
-            tickers = [t.strip().upper() for t in tickers_text.replace("\n", ",").split(",") if t.strip()]
+    try:
+        if universe_mode == "Paste tickers":
+            if tickers_text:
+                tickers = [t.strip().upper() for t in tickers_text.replace("\n", ",").split(",") if t.strip()]
 
-    elif universe_mode == "Upload CSV":
-        if uploaded is None:
-            return [], "Upload a CSV with a 'Ticker' column."
-        dfu = pd.read_csv(uploaded)
-        if "Ticker" not in dfu.columns:
-            return [], "CSV must contain a 'Ticker' column."
-        tickers = dfu["Ticker"].astype(str).str.upper().str.strip().tolist()
+        elif universe_mode == "Upload CSV":
+            if uploaded is None:
+                return [], "Upload a CSV with a 'Ticker' column."
+            dfu = pd.read_csv(uploaded)
+            if "Ticker" not in dfu.columns:
+                return [], "CSV must contain a 'Ticker' column."
+            tickers = dfu["Ticker"].astype(str).str.upper().str.strip().tolist()
 
-    elif universe_mode == "S&P 500 (ETF proxy: SPY)":
-        tickers = get_universe("etf:SPY")
+        elif universe_mode == "S&P 500 (ETF proxy: SPY)":
+            tickers = get_universe("etf:SPY")
 
-    elif universe_mode == "Nasdaq-100 (ETF proxy: QQQ)":
-        tickers = get_universe("etf:QQQ")
+        elif universe_mode == "Nasdaq-100 (ETF proxy: QQQ)":
+            tickers = get_universe("etf:QQQ")
 
-    elif universe_mode == "Russell 1000 (ETF proxy: IWB)":
-        tickers = get_universe("etf:IWB")
+        elif universe_mode == "Russell 1000 (ETF proxy: IWB)":
+            tickers = get_universe("etf:IWB")
 
-    elif universe_mode == "S&P 500 (Wikipedia)":
-        tickers = get_universe("sp500")
+        elif universe_mode == "S&P 500 (Wikipedia)":
+            tickers = get_universe("sp500")
 
-    elif universe_mode == "Nasdaq 100 (Wikipedia)":
-        tickers = get_universe("nasdaq100")
+        elif universe_mode == "Nasdaq 100 (Wikipedia)":
+            tickers = get_universe("nasdaq100")
+
+    except Exception as e:
+        return [], f"Failed to load universe: {e}"
 
     tickers = [t for t in tickers if t and isinstance(t, str)]
     tickers = [t.strip().upper() for t in tickers if t.strip()]
-    tickers = sorted(list(dict.fromkeys(tickers)))  # stable dedupe + stable order
+    tickers = sorted(list(dict.fromkeys(tickers)))  # stable dedupe
     return tickers, None
 
 
@@ -210,14 +217,13 @@ with st.sidebar:
 
     if refresh_prices:
         cached_prices.clear()
-        # keep computed df; will recompute prices on next Run
         st.toast("Prices cache cleared. Click Run screen.", icon="🔄")
+
     if refresh_fund:
         cached_fundamentals.clear()
         st.toast("Fundamentals cache cleared. Click Run screen.", icon="🔄")
 
     st.divider()
-
     st.header("Controls")
 
     with st.form("screen_controls"):
@@ -306,8 +312,8 @@ if run_screen:
             "selected_setups": tuple(selected_setups),
             "max_workers": int(max_workers),
             "throttle_safe_mode": bool(throttle_safe_mode),
-            # short-term params (may be None)
-            "st_params": repr(st_params) if st_params is not None else None,
+            # store short-term params object directly so results are stable
+            "st_params_obj": st_params,
         }
         st.session_state["screen_params"] = params
         st.session_state["screen_error"] = None
@@ -326,6 +332,7 @@ if not params:
 mode = params["mode"]
 tickers = list(params["tickers"])
 selected_setups = list(params["selected_setups"])
+st_params = params.get("st_params_obj", None)
 
 if not tickers:
     st.info("Add tickers via sidebar and click **Run screen**.")
@@ -335,7 +342,6 @@ st.write(f"Universe size: **{len(tickers)}**")
 
 # Compute hash to decide whether we need to recompute heavy outputs
 screen_hash = _stable_hash(params)
-
 need_recompute = (st.session_state.get("screen_hash") != screen_hash) or ("prices" not in st.session_state)
 
 # Always include SPY for RS + benchmark backtests
@@ -362,9 +368,14 @@ if need_recompute:
             df_full = score_table(metrics_df)
             df_full = add_data_quality_badges(df_full)
             df_full = classify_setups(df_full)
+
+            # ✅ add trader decision layer (Action / Chase risk / Entries / Invalidation / Management)
+            df_full = add_decisions_long_term(df_full, prices)
+
             # Stable ranking (important!)
             if "score" in df_full.columns and "ticker" in df_full.columns:
                 df_full = df_full.sort_values(["score", "ticker"], ascending=[False, True]).reset_index(drop=True)
+
             s.update(label="Done.", state="complete")
 
         st.session_state["fundamentals"] = fundamentals
@@ -373,17 +384,7 @@ if need_recompute:
 
     else:
         # Short-term compute
-        st_params_obj = None
-        if params.get("st_params"):
-            # We stored repr only; easiest is rebuild by reusing current sidebar values via session_state,
-            # but since this is a drop-in and you want stability, we recompute from current form variables when run pressed.
-            # So we also stash the actual object when run pressed:
-            pass
-
-        # We’ll rebuild st_params from the current sidebar variables if present in locals
-        # (when mode==Short-term, st_params exists above from the form).
-        if "st_params" not in locals() or st_params is None:
-            # Fallback defaults
+        if st_params is None:
             st_params = ShortTermParams(
                 min_avg_dollar_vol=20_000_000,
                 require_above_ma50=True,
@@ -405,6 +406,7 @@ if need_recompute:
 
             if "short_score" in st_table_full.columns and "ticker" in st_table_full.columns:
                 st_table_full = st_table_full.sort_values(["short_score", "ticker"], ascending=[False, True]).reset_index(drop=True)
+
             s.update(label="Short-term metrics ready.", state="complete")
 
         st.session_state["st_table_full"] = st_table_full
@@ -504,13 +506,6 @@ if mode == "Short-term":
     plan_from_n = st.slider("Build plan from top N short-term names", 3, min(60, len(st_table)), 25, 1)
     ranked_for_plan = st_table.head(plan_from_n)["ticker"].tolist()
 
-    # Use the original st_params values for ranker filters if those columns exist in prices snapshot
-    # For simplicity, use static “require above MA50” logic as before:
-    # (If you want, we can persist the exact st_params values in session_state as well.)
-    require_ma50 = True
-    require_ma200 = False
-    min_adv = 20_000_000.0
-
     if use_corr_cap:
         plan_universe = correlation_filter(
             prices=prices,
@@ -579,9 +574,9 @@ if mode == "Short-term":
             prices_long=prices,
             universe=tickers,
             momentum_col=mom_col,
-            min_adv=float(min_adv),
-            require_above_ma50=bool(require_ma50),
-            require_above_ma200=bool(require_ma200),
+            min_adv=20_000_000.0,
+            require_above_ma50=True,
+            require_above_ma200=False,
         )
 
         rb2 = backtest_rebalanced_v2(
@@ -627,7 +622,18 @@ if df_view.empty:
     st.warning("No tickers passed your setup filter. Loosen filters and click Run screen.")
     st.stop()
 
-show_cols = [c for c in ["ticker", "setup_type", "setup_reason", "score"] if c in df_view.columns]
+# ✅ Actionable top table
+primary_cols = [
+    "ticker",
+    "action",
+    "chase_risk",
+    "setup_type",
+    "score",
+    "pct_above_ma50_text",
+    "entry_pullback",
+    "invalidation",
+]
+show_cols = [c for c in primary_cols if c in df_view.columns]
 st.dataframe(df_view[show_cols], width="stretch", height=420)
 
 st.subheader("Ranked results")
@@ -645,7 +651,13 @@ with c1:
 with c2:
     row = df_view[df_view["ticker"] == pick].iloc[0].to_dict()
     st.metric("Score", f"{row.get('score', 0):.1f}")
-    st.write(row)
+
+    # ✅ Decision card
+    st.subheader("Decision Card")
+    st.write(decision_card(row))
+
+    with st.expander("Raw metrics (debug)"):
+        st.write(row)
 
 st.subheader("Financial trends")
 t1, t2 = st.columns(2)
@@ -717,10 +729,11 @@ else:
             use_container_width=True,
         )
         st.write(rb2.stats)
+
         cta, ctb = st.columns(2)
         with cta:
             with st.expander("Holdings (weights by rebalance date)"):
                 st.dataframe(rb2.holdings, width="stretch", height=260)
         with ctb:
-            with st.expander("Turnover & costs by rebalance date)"):
+            with st.expander("Turnover & costs by rebalance date"):
                 st.dataframe(rb2.trades, width="stretch", height=260)
