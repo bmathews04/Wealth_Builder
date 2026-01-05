@@ -59,9 +59,9 @@ with st.sidebar:
             "Upload CSV",
             "S&P 500 (ETF proxy: SPY)",
             "Nasdaq-100 (ETF proxy: QQQ)",
-            # Optional: keep these only if your get_universe still supports them
-            # "S&P 500 (Wikipedia)",
-            # "Nasdaq-100 (Wikipedia)",
+            # Optional: keep these if you want direct wiki calls too
+            "S&P 500 (Wikipedia)",
+            "Nasdaq 100 (Wikipedia)",
         ],
         index=0,
     )
@@ -98,6 +98,22 @@ with st.sidebar:
             tickers = get_universe("etf:QQQ")
         except Exception as e:
             st.error(f"Failed to load QQQ holdings universe: {e}")
+
+    elif universe_mode == "S&P 500 (Wikipedia)":
+        try:
+            tickers = get_universe("sp500")
+        except Exception as e:
+            st.error(f"Failed to load S&P 500 from Wikipedia: {e}")
+
+    elif universe_mode == "Nasdaq 100 (Wikipedia)":
+        try:
+            tickers = get_universe("nasdaq100")
+        except Exception as e:
+            st.error(f"Failed to load Nasdaq-100 from Wikipedia: {e}")
+
+    # Optional cleanup
+    tickers = [t for t in tickers if t]
+    tickers = list(dict.fromkeys(tickers))  # dedupe, preserve order
 
     st.divider()
     st.header("Performance")
