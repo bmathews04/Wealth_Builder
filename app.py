@@ -54,13 +54,22 @@ with st.sidebar:
     st.header("Universe")
     universe_mode = st.selectbox(
         "Pick a universe",
-        ["Paste tickers", "Upload CSV", "S&P 500 (Wikipedia)", "Nasdaq 100 (Wikipedia)"],
+        [
+            "Paste tickers",
+            "Upload CSV",
+            "S&P 500 (ETF proxy: SPY)",
+            "Nasdaq-100 (ETF proxy: QQQ)",
+            # Optional: keep these only if your get_universe still supports them
+            # "S&P 500 (Wikipedia)",
+            # "Nasdaq-100 (Wikipedia)",
+        ],
         index=0,
     )
 
     st.caption(f"Universe module: {UNIVERSE_MODULE_VERSION}")
 
-    tickers = []
+    tickers: list[str] = []
+
     if universe_mode == "Paste tickers":
         tickers_text = st.text_area(
             "Tickers (comma or newline separated)",
@@ -78,8 +87,17 @@ with st.sidebar:
             else:
                 tickers = dfu["Ticker"].astype(str).str.upper().str.strip().tolist()
 
-    else:
-        tickers = get_universe("sp500" if "S&P 500" in universe_mode else "nasdaq100")
+    elif universe_mode == "S&P 500 (ETF proxy: SPY)":
+        try:
+            tickers = get_universe("etf:SPY")
+        except Exception as e:
+            st.error(f"Failed to load SPY holdings universe: {e}")
+
+    elif universe_mode == "Nasdaq-100 (ETF proxy: QQQ)":
+        try:
+            tickers = get_universe("etf:QQQ")
+        except Exception as e:
+            st.error(f"Failed to load QQQ holdings universe: {e}")
 
     st.divider()
     st.header("Performance")
@@ -88,6 +106,9 @@ with st.sidebar:
 
     throttle_safe_mode = st.checkbox("Throttle-safe mode", value=False)
     st.caption("If screening large universes and seeing missing fundamentals, enable this.")
+
+    tickers = [t for t in tickers if t]  # remove blanks
+    tickers = list(dict.fromkeys(tickers))  # dedupe preserve order
 
 
 # ----------------------------
