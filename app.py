@@ -280,7 +280,7 @@ if mode == "Short-term":
     try:
         st_table = classify_setups(st_table)
         if selected_setups:
-            st_table = st_table[st_table["setup"].isin(selected_setups)].copy()
+            st_table = st_table[st_table["setup_type"].isin(selected_setups)].copy()
     except Exception:
         pass
 
@@ -463,6 +463,18 @@ with st.status("Computing long-term metrics + scoring…", expanded=False) as s:
 
 df = scored.copy()
 
+# --- Setup labeling + filter (applies to Long-term too) ---
+df = classify_setups(df)
+
+if selected_setups:
+    df = df[df["setup_type"].isin(selected_setups)].copy()
+show_cols = ["ticker", "setup_type", "setup_reason", "score"]
+st.dataframe(
+    df.sort_values("score", ascending=False)[show_cols],
+    width="stretch",
+    height=420,
+)
+
 st.subheader("Ranked results")
 st.dataframe(df.sort_values("score", ascending=False), width="stretch", height=420)
 
@@ -480,7 +492,7 @@ with c1:
     st.plotly_chart(make_drawdown_chart(prices, pick), use_container_width=True)
 
 with c2:
-    row = scored[scored["ticker"] == pick].iloc[0].to_dict()
+    row = df[df["ticker"] == pick].iloc[0].to_dict()
     st.metric("Score", f"{row.get('score', 0):.1f}")
     st.write(row)
 
