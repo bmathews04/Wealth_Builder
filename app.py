@@ -2,7 +2,7 @@
 import streamlit as st
 import pandas as pd
 
-from wb.universe import get_universe
+from wb.universe import get_universe, UNIVERSE_MODULE_VERSION
 from wb.prices import batch_fetch_prices
 
 from wb.fundamentals import fetch_fundamentals_parallel
@@ -57,6 +57,8 @@ with st.sidebar:
         ["Paste tickers", "Upload CSV", "S&P 500 (Wikipedia)", "Nasdaq 100 (Wikipedia)"],
         index=0,
     )
+
+    st.caption(f"Universe module: {UNIVERSE_MODULE_VERSION}")
 
     tickers = []
     if universe_mode == "Paste tickers":
