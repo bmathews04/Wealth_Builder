@@ -1,8 +1,8 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Optional
-
 import pandas as pd
+
 
 @dataclass
 class FundamentalsBundle:
@@ -14,6 +14,9 @@ class FundamentalsBundle:
     cashflow_q: pd.DataFrame
     meta: Dict[str, Optional[str]]  # sector, industry
 
+
 class FundamentalsProvider:
+    name: str = "base"
+
     def get(self, ticker: str) -> FundamentalsBundle:
         raise NotImplementedError
